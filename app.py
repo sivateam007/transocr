@@ -1,4 +1,4 @@
-"""OCR Solutions – Background OCR with progress tracking, Mega cloud, keepalive"""
+"""OCR Solutions — Background OCR with progress tracking, Mega cloud, keepalive, JSON persistence"""
 
 import os
 import re
@@ -6,8 +6,13 @@ import json
 import tempfile
 import threading
 import time
+import gc
+import uuid
+import logging
+import shutil
 from io import BytesIO
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _CTimeoutError
 
 from flask import Flask, flash, redirect, render_template_string, request, send_file, jsonify
 from pdf2image import convert_from_path, pdfinfo_from_path
@@ -15,24 +20,10 @@ from PIL import Image
 import pytesseract
 import requests
 
-HTML_HEADER = '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n<title>OCR Solutions – {{ title }}</title>\n<style>\n* { margin: 0; padding: 0; box-sizing: border-box; font-family: \'Segoe UI\', Tahoma, Geneva, Verdana, sans-serif; }\n:root { --primary: #0c1f33; --secondary: #125683; --accent: #7f89d4; --light: #ecf0f1; --dark: #2c3e50; --success: #27ae60; --git-color: #e24124; }\nbody { line-height: 1.6; color: #333; background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%); min-height: 100vh; }\nheader { background: linear-gradient(135deg, var(--primary), var(--secondary)); color: white; padding: 0.8rem 0; position: sticky; top: 0; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }\n.header-container { display: flex; justify-content: space-between; align-items: center; max-width: 1200px; margin: 0 auto; padding: 0 20px; }\n.logo h1 { font-size: 1.6rem; color: white; letter-spacing: 2px; }\n.logo span { color: var(--accent); font-weight: 300; letter-spacing: 1px; }\n.header-nav { display: flex; gap: 0.8rem; }\n.header-nav a { display: flex; align-items: center; gap: 6px; padding: 8px 18px; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 0.95rem; transition: all 0.3s; color: rgba(255,255,255,0.8); }\n.header-nav a:hover { background: rgba(255,255,255,0.15); color: white; }\n.header-nav a.active { background: var(--git-color); color: white; }\n.page-title { text-align: center; margin: 2.5rem 0 1.5rem; color: var(--dark); }\n.page-title:after { content: \'\'; display: block; width: 80px; height: 4px; background: var(--git-color); margin: 10px auto; border-radius: 2px; }\n.container { max-width: 900px; margin: 0 auto; padding: 0 20px; }\n.card { margin-bottom: 2rem; padding: 2rem; border-radius: 15px; background: white; box-shadow: 0 10px 30px rgba(0,0,0,0.1); }\n.card h2 { color: var(--dark); margin-bottom: 1.5rem; padding-bottom: 0.5rem; border-bottom: 2px solid var(--git-color); display: inline-block; font-size: 1.3rem; }\n.doc-types { display: flex; gap: 0.6rem; flex-wrap: wrap; margin-bottom: 1.2rem; }\n.doc-type-btn { padding: 10px 18px; border-radius: 10px; border: 2px solid #dee2e6; background: white; color: var(--dark); font-weight: 600; font-size: 0.9rem; cursor: pointer; transition: all 0.3s; display: flex; align-items: center; gap: 6px; }\n.doc-type-btn:hover { border-color: var(--accent); background: #f0f2ff; }\n.doc-type-btn.active { background: var(--git-color); color: white; border-color: var(--git-color); }\n.file-upload-area { border: 2px dashed #dee2e6; border-radius: 12px; padding: 2rem; text-align: center; margin-bottom: 1.2rem; cursor: pointer; transition: all 0.3s; position: relative; }\n.file-upload-area:hover { border-color: var(--accent); background: #f8f9ff; }\n.file-upload-area.has-file { border-color: var(--success); background: #f0fff4; }\n.file-upload-area input[type=file] { position: absolute; top: 0; left: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }\n.file-upload-area .upload-icon { font-size: 2.5rem; margin-bottom: 0.5rem; }\n.file-upload-area p { color: #666; font-size: 0.95rem; }\n.file-upload-area .file-name { font-weight: 600; color: var(--success); margin-top: 0.3rem; }\n.form-row { display: flex; gap: 1rem; margin-bottom: 1.2rem; flex-wrap: wrap; }\n.form-row select, .form-row input[type=number] { flex: 1; min-width: 120px; padding: 11px 14px; border-radius: 8px; border: 2px solid #dee2e6; font-size: 0.95rem; background: white; color: #333; }\n.form-row select:focus, .form-row input:focus { outline: none; border-color: var(--accent); }\n.form-row label { display: flex; align-items: center; gap: 8px; color: #555; font-size: 0.9rem; white-space: nowrap; }\n.upload-btn { background: linear-gradient(135deg, var(--git-color), #e74c3c); color: white; border: none; padding: 14px 30px; border-radius: 10px; font-size: 1.1rem; font-weight: 700; cursor: pointer; transition: all 0.3s; width: 100%; display: flex; align-items: center; justify-content: center; gap: 10px; }\n.upload-btn:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(0,0,0,0.2); }\n.upload-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }\n.tip-box { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-left: 6px solid #ffd700; padding: 1.5rem; border-radius: 12px; color: white; box-shadow: 0 8px 25px rgba(102,126,234,0.3); position: relative; overflow: hidden; }\n.tip-box h4 { color: #ffd700; margin-bottom: 1rem; display: flex; align-items: center; gap: 10px; font-size: 1.1rem; }\n.tip-box p { font-size: 1rem; line-height: 1.6; }\n.formats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.8rem; margin-top: 1rem; }\n.format-card { background: var(--light); padding: 1rem; border-radius: 8px; text-align: center; font-weight: 600; color: var(--dark); font-size: 0.9rem; }\n.progress-page { text-align: center; padding: 1rem 0; }\n.task-id { font-family: monospace; background: #f0f0f0; padding: 4px 12px; border-radius: 6px; font-size: 0.9rem; color: #666; display: inline-block; margin-bottom: 0.5rem; }\n.progress-filename { font-size: 1.2rem; font-weight: 600; color: var(--dark); margin-bottom: 0.3rem; }\n.progress-status { display: flex; justify-content: center; gap: 2rem; flex-wrap: wrap; margin: 1.5rem 0; }\n.progress-stat { text-align: center; }\n.progress-stat .value { font-size: 1.5rem; font-weight: 700; color: var(--primary); }\n.progress-stat .label { font-size: 0.85rem; color: #888; }\n.progress-bar-bg { width: 100%; height: 24px; background: #e9ecef; border-radius: 12px; overflow: hidden; margin: 1rem 0; }\n.progress-bar-fill { height: 100%; background: linear-gradient(90deg, var(--git-color), #e74c3c); border-radius: 12px; transition: width 0.5s; }\n.flash { padding: 0.8rem 1.2rem; border-radius: 8px; margin-bottom: 1rem; font-weight: 500; }\n.flash.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }\n.flash.error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }\n.download-table { width: 100%; border-collapse: collapse; }\n.download-table th { background: var(--primary); color: white; padding: 10px 12px; text-align: left; font-weight: 600; font-size: 0.9rem; }\n.download-table td { padding: 10px 12px; border-bottom: 1px solid #dee2e6; font-size: 0.9rem; }\n.download-table tr:hover { background: #f1f5f9; }\n.download-table .status-badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; }\n.download-table .status-badge.processing { background: #fff3cd; color: #856404; }\n.download-table .status-badge.completed { background: #d4edda; color: #155724; }\n.download-table .status-badge.failed { background: #f8d7da; color: #721c24; }\n.btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 18px; border-radius: 8px; font-weight: 600; text-decoration: none; transition: all 0.3s; border: none; cursor: pointer; font-size: 0.9rem; }\n.btn-primary { background: linear-gradient(135deg, var(--git-color), #e74c3c); color: white; }\n.btn-primary:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.2); }\n.btn-secondary { background: white; color: var(--primary); border: 2px solid var(--primary); }\n.btn-secondary:hover { background: var(--primary); color: white; }\n.section-title { font-size: 1.1rem; font-weight: 700; color: var(--dark); margin: 1.5rem 0 0.8rem; padding-bottom: 0.3rem; border-bottom: 2px solid var(--accent); display: inline-block; }\n.empty-state { text-align: center; padding: 3rem; color: #999; }\n.empty-state p { font-size: 1.1rem; margin-bottom: 1rem; }\n@media (max-width: 768px) { .header-container { flex-direction: column; gap: 0.5rem; } .header-nav a { font-size: 0.85rem; padding: 6px 12px; } .form-row { flex-direction: column; } .doc-types { justify-content: center; } .progress-status { gap: 1rem; } .logo h1 { font-size: 1.3rem; } }\n</style>\n</head>\n<body>\n<header>\n    <div class="header-container">\n        <div class="logo"><h1>OCR <span>Solutions</span></h1></div>\n        <nav class="header-nav">\n            <a href="/" class="{{ \'active\' if active == \'upload\' else \'\' }}">&#128228; Upload</a>\n            <a href="/downloads" class="{{ \'active\' if active == \'downloads\' else \'\' }}">&#128230; Downloads</a>\n        </nav>\n    </div>\n</header>\n<div class="container">\n{% for cat, msg in flashes %}\n<div class="flash {{ cat }}">{{ msg }}</div>\n{% endfor %}\n</div>\n'
+gc.set_threshold(100, 5, 2)
 
-HTML_CLOSING = '</body>\n</html>\n'
-
-import os
-import re
-import json
-import tempfile
-import threading
-import time
-from io import BytesIO
-from datetime import datetime
-
-from flask import Flask, flash, redirect, render_template_string, request, send_file, jsonify
-from pdf2image import convert_from_path, pdfinfo_from_path
-from PIL import Image
-import pytesseract
-import requests
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 MEGA_AVAILABLE = False
 try:
@@ -51,20 +42,34 @@ try:
 except ImportError:
     load_workbook = None
 
+BATCH_SIZE = 1
+CHECKPOINT_INTERVAL = 5
+MEGA_LOGIN_TIMEOUT = 30
+CONVERT_TIMEOUT = 120
+OCR_TIMEOUT = 300
+
 app = Flask(__name__)
-app.secret_key = os.urandom(32)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", os.urandom(24).hex())
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 
 tasks = {}
 results = {}
 tasks_order = []
 tasks_lock = threading.Lock()
+
 MEGA_EMAIL = os.environ.get("MEGA_EMAIL", "")
 MEGA_PASSWORD = os.environ.get("MEGA_PASSWORD", "")
 KEEPALIVE_URL = os.environ.get("KEEPALIVE_URL", "")
-_keepalive_started = False
+
+_active_tasks = 0
+_keepalive_lock = threading.Lock()
+_keepalive_thread = None
+
 _mega_client = None
 _mega_lock = threading.Lock()
+
+PROGRESS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "progress_tracker.json")
+_last_save_time = 0
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".gif"}
 TEXT_EXTS = {".txt", ".csv", ".tsv", ".md", ".json", ".xml"}
@@ -88,6 +93,152 @@ LANG_OPTIONS = {
     "urd": "Urdu", "san": "Sanskrit",
 }
 
+HTML_HEADER = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OCR Solutions - {{ title }}</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+:root { --primary: #0c1f33; --secondary: #125683; --accent: #7f89d4; --light: #ecf0f1; --dark: #2c3e50; --success: #27ae60; --git-color: #e24124; }
+body { line-height: 1.6; color: #333; background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%); min-height: 100vh; }
+header { background: linear-gradient(135deg, var(--primary), var(--secondary)); color: white; padding: 0.8rem 0; position: sticky; top: 0; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+.header-container { display: flex; justify-content: space-between; align-items: center; max-width: 1200px; margin: 0 auto; padding: 0 20px; }
+.logo h1 { font-size: 1.6rem; color: white; letter-spacing: 2px; }
+.logo span { color: var(--accent); font-weight: 300; letter-spacing: 1px; }
+.header-nav { display: flex; gap: 0.8rem; }
+.header-nav a { display: flex; align-items: center; gap: 6px; padding: 8px 18px; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 0.95rem; transition: all 0.3s; color: rgba(255,255,255,0.8); }
+.header-nav a:hover { background: rgba(255,255,255,0.15); color: white; }
+.header-nav a.active { background: var(--git-color); color: white; }
+.page-title { text-align: center; margin: 2.5rem 0 1.5rem; color: var(--dark); }
+.page-title:after { content: ''; display: block; width: 80px; height: 4px; background: var(--git-color); margin: 10px auto; border-radius: 2px; }
+.container { max-width: 900px; margin: 0 auto; padding: 0 20px; }
+.card { margin-bottom: 2rem; padding: 2rem; border-radius: 15px; background: white; box-shadow: 0 10px 30px rgba(0,0,0,0.1); }
+.card h2 { color: var(--dark); margin-bottom: 1.5rem; padding-bottom: 0.5rem; border-bottom: 2px solid var(--light); }
+.btn { display: inline-flex; align-items: center; gap: 6px; padding: 10px 24px; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; text-decoration: none; transition: all 0.3s; }
+.btn-primary { background: linear-gradient(135deg, var(--secondary), var(--accent)); color: white; }
+.btn-primary:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(18,86,131,0.4); }
+.btn-secondary { background: #6c757d; color: white; }
+.btn-secondary:hover { transform: translateY(-2px); }
+.btn-danger { background: var(--git-color); color: white; }
+.btn-danger:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(226,65,36,0.4); }
+.btn-sm { padding: 6px 14px; font-size: 0.85rem; }
+.doc-types { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 1.5rem; justify-content: center; }
+.doc-type-btn { flex: 1; min-width: 100px; padding: 12px 8px; border: 2px solid #dee2e6; border-radius: 10px; background: white; cursor: pointer; font-size: 0.85rem; font-weight: 600; transition: all 0.3s; text-align: center; }
+.doc-type-btn:hover { border-color: var(--accent); background: #f0f2ff; }
+.doc-type-btn.active { border-color: var(--git-color); background: #fff0ee; color: var(--git-color); }
+.file-upload-area { border: 2px dashed #ccc; border-radius: 12px; padding: 2.5rem; text-align: center; transition: all 0.3s; margin-bottom: 1.2rem; cursor: pointer; }
+.file-upload-area:hover { border-color: var(--accent); background: #f8f9ff; }
+.file-upload-area.has-file { border-color: var(--success); background: #f0fff4; }
+.file-upload-area .upload-icon { font-size: 3rem; margin-bottom: 0.5rem; }
+.file-upload-area p { color: #888; font-size: 0.95rem; }
+.file-name { margin-top: 0.5rem; font-weight: 600; color: var(--dark); word-break: break-all; }
+#file-input { display: none; }
+.form-row { display: flex; gap: 10px; margin-bottom: 1rem; flex-wrap: wrap; align-items: center; }
+.form-row select, .form-row input[type=number] { flex: 1; min-width: 120px; padding: 10px 14px; border: 2px solid #dee2e6; border-radius: 8px; font-size: 0.95rem; background: white; }
+.form-row select:focus, .form-row input:focus { outline: none; border-color: var(--accent); }
+.form-row label { display: flex; align-items: center; gap: 8px; font-weight: 600; color: var(--dark); cursor: pointer; }
+.form-row input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--secondary); }
+.upload-btn { width: 100%; padding: 14px; background: linear-gradient(135deg, var(--secondary), var(--accent)); color: white; border: none; border-radius: 10px; font-size: 1.1rem; font-weight: 600; cursor: pointer; transition: all 0.3s; }
+.upload-btn:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(18,86,131,0.4); }
+.formats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px,1fr)); gap: 10px; }
+.format-card { padding: 12px; background: var(--light); border-radius: 8px; text-align: center; font-weight: 600; color: var(--dark); font-size: 0.9rem; }
+.tip-box { background: #fff8e1; border-left: 4px solid #ffc107; padding: 1rem 1.5rem; border-radius: 8px; }
+.tip-icon { font-size: 1.2rem; }
+.progress-page .task-id { font-size: 0.8rem; color: #999; margin-bottom: 5px; word-break: break-all; }
+.progress-filename { font-size: 1.2rem; font-weight: 700; color: var(--dark); margin-bottom: 1.5rem; word-break: break-all; }
+.progress-status { display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: 12px; margin-bottom: 1.5rem; }
+.progress-stat { text-align: center; padding: 10px; background: var(--light); border-radius: 10px; }
+.progress-stat .value { font-size: 1.3rem; font-weight: 700; color: var(--dark); }
+.progress-stat .label { font-size: 0.75rem; color: #888; margin-top: 4px; text-transform: uppercase; letter-spacing: 1px; }
+.progress-bar-bg { height: 14px; background: #e9ecef; border-radius: 10px; overflow: hidden; margin: 1rem 0; }
+.progress-bar-fill { height: 100%; background: linear-gradient(90deg, var(--secondary), var(--accent)); border-radius: 10px; transition: width 1s ease; }
+.progress-actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-top: 1.5rem; }
+.status-badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; }
+.status-badge.processing { background: #fff3cd; color: #856404; }
+.status-badge.completed { background: #d4edda; color: #155724; }
+.status-badge.failed { background: #f8d7da; color: #721c24; }
+.status-badge.interrupted { background: #e2e3e5; color: #383d41; }
+.section-title { margin: 1.5rem 0 1rem; padding-bottom: 8px; border-bottom: 2px solid var(--light); color: var(--dark); }
+.download-table { width: 100%; border-collapse: collapse; margin-bottom: 1rem; }
+.download-table th { background: var(--light); color: var(--dark); padding: 10px 12px; text-align: left; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1px; white-space: nowrap; }
+.download-table td { padding: 10px 12px; border-bottom: 1px solid #eee; font-size: 0.9rem; word-break: break-all; }
+.download-table tr:hover { background: #f8f9fa; }
+.download-table .actions { white-space: nowrap; }
+.flash-msg { padding: 12px 20px; margin-bottom: 1rem; border-radius: 8px; font-weight: 600; }
+.flash-msg.error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+.flash-msg.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+/* Preview modal */
+.modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center; }
+.modal-overlay.active { display: flex; }
+.modal-content { background: white; border-radius: 12px; max-width: 700px; width: 90%; max-height: 80vh; overflow-y: auto; padding: 2rem; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
+.modal-content h3 { margin-bottom: 1rem; }
+.modal-content pre { background: #f5f5f5; padding: 1rem; border-radius: 8px; font-size: 0.85rem; white-space: pre-wrap; word-break: break-word; max-height: 50vh; overflow-y: auto; }
+.modal-close { float: right; background: none; border: none; font-size: 1.5rem; cursor: pointer; color: #999; }
+.modal-close:hover { color: #333; }
+@media (max-width:600px) { .header-container { flex-direction: column; gap: 8px; } .doc-type-btn { min-width: 70px; font-size: 0.75rem; padding: 10px 4px; } .form-row { flex-direction: column; } .progress-status { grid-template-columns: repeat(3, 1fr); } }
+</style>
+</head>
+<body>
+<header>
+<div class="header-container">
+<div class="logo"><h1>OCR <span>Solutions</span></h1></div>
+<nav class="header-nav">
+<a href="/" class="{{ 'active' if active == 'upload' else '' }}">\U0001F4C1 Upload</a>
+<a href="/downloads" class="{{ 'active' if active == 'downloads' else '' }}">\U0001F4E6 My Downloads</a>
+</nav>
+</div>
+</header>
+{% for f in flashes %}
+<div class="flash-msg {{ f[1] }}">{{ f[0] }}</div>
+{% endfor %}
+'''
+
+HTML_CLOSING = '\n</body>\n</html>\n'
+
+
+def _get_memory_mb():
+    try:
+        if os.name == 'posix':
+            with open('/proc/self/status') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return 0
+
+
+def _save_progress(force=False):
+    global _last_save_time
+    now = time.time()
+    if not force and now - _last_save_time < 2:
+        return
+    serializable = {}
+    with tasks_lock:
+        for tid, task in tasks.items():
+            d = dict(task)
+            d.pop('filepath', None)
+            serializable[tid] = d
+    try:
+        with open(PROGRESS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(serializable, f, default=str, ensure_ascii=False)
+        _last_save_time = now
+    except Exception as e:
+        logger.error(f"Save progress failed: {e}")
+
+
+def _load_progress():
+    if not os.path.exists(PROGRESS_FILE):
+        return {}
+    try:
+        with open(PROGRESS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Load progress failed: {e}")
+        return {}
+
 
 def get_mega():
     global _mega_client
@@ -103,6 +254,132 @@ def get_mega():
         except Exception:
             _mega_client = None
     return _mega_client
+
+
+def mega_call(m, method_name, *args, timeout=MEGA_LOGIN_TIMEOUT, **kwargs):
+    fn = getattr(m, method_name)
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = pool.submit(fn, *args, **kwargs)
+        return future.result(timeout=timeout)
+    except _CTimeoutError:
+        logger.warning(f"Mega.{method_name} timed out after {timeout}s")
+        raise
+    finally:
+        pool.shutdown(wait=False)
+
+
+def init_mega():
+    email = os.environ.get("MEGA_EMAIL", "")
+    password = os.environ.get("MEGA_PASSWORD", "")
+    if not email or not password:
+        return None
+    try:
+        mega = Mega()
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = pool.submit(mega.login, email, password)
+            return future.result(timeout=MEGA_LOGIN_TIMEOUT)
+        finally:
+            pool.shutdown(wait=False)
+    except Exception as e:
+        logger.error(f"Mega login failed: {e}")
+        return None
+
+
+def ensure_mega_folder(m, folder_name):
+    try:
+        folder = mega_call(m, "find", folder_name, timeout=15)
+    except Exception:
+        return None
+    if folder:
+        return folder[0] if isinstance(folder, (list, tuple)) else folder
+    try:
+        result = mega_call(m, "create_folder", folder_name, timeout=15)
+        return result.get(folder_name)
+    except Exception:
+        return None
+
+
+def upload_checkpoint(m, task_id, output_path, metadata):
+    folder_name = "ocr-checkpoints"
+    folder_handle = ensure_mega_folder(m, folder_name)
+    if not folder_handle:
+        return False
+    try:
+        old_ckpt = mega_call(m, "find", f"{folder_name}/{task_id}.checkpoint", timeout=15)
+        if old_ckpt:
+            mega_call(m, "delete", old_ckpt[0] if isinstance(old_ckpt, (list, tuple)) else old_ckpt)
+    except Exception:
+        pass
+    try:
+        old_out = mega_call(m, "find", f"{folder_name}/{task_id}_output.txt", timeout=15)
+        if old_out:
+            mega_call(m, "delete", old_out[0] if isinstance(old_out, (list, tuple)) else old_out)
+    except Exception:
+        pass
+    ckpt_file = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8')
+    json.dump(metadata, ckpt_file)
+    ckpt_file.close()
+    try:
+        mega_call(m, "upload", ckpt_file.name, dest=folder_handle, dest_filename=f"{task_id}.checkpoint", timeout=120)
+    except Exception as e:
+        logger.error(f"Checkpoint metadata upload failed: {e}")
+        os.unlink(ckpt_file.name)
+        return False
+    os.unlink(ckpt_file.name)
+    try:
+        mega_call(m, "upload", output_path, dest=folder_handle, dest_filename=f"{task_id}_output.txt", timeout=120)
+    except Exception as e:
+        logger.error(f"Checkpoint output upload failed: {e}")
+        return False
+    logger.info(f"Checkpoint saved for task {task_id} at page {metadata.get('last_page')}")
+    return True
+
+
+def cleanup_checkpoints(m, task_id):
+    folder_name = "ocr-checkpoints"
+    try:
+        old_ckpt = mega_call(m, "find", f"{folder_name}/{task_id}.checkpoint", timeout=15)
+        if old_ckpt:
+            mega_call(m, "delete", old_ckpt[0] if isinstance(old_ckpt, (list, tuple)) else old_ckpt)
+    except Exception:
+        pass
+    try:
+        old_out = mega_call(m, "find", f"{folder_name}/{task_id}_output.txt", timeout=15)
+        if old_out:
+            mega_call(m, "delete", old_out[0] if isinstance(old_out, (list, tuple)) else old_out)
+    except Exception:
+        pass
+
+
+def upload_to_mega(local_file_path, remote_filename):
+    if not os.path.exists(local_file_path):
+        return None
+    m = init_mega()
+    if not m:
+        return None
+    try:
+        folder = mega_call(m, "find", "ocr-outputs", timeout=15)
+    except Exception:
+        return None
+    if not folder:
+        try:
+            folder_node = mega_call(m, "create_folder", "ocr-outputs", timeout=15)
+            dest = folder_node.get("ocr-outputs")
+        except Exception:
+            return None
+    else:
+        dest = folder[0] if isinstance(folder, (list, tuple)) else folder
+    if not dest:
+        return None
+    try:
+        file_node = mega_call(m, "upload", local_file_path, dest=dest, timeout=120)
+        link = mega_call(m, "get_upload_link", file_node, timeout=30)
+        return link
+    except Exception as e:
+        logger.error(f"Mega upload failed: {e}")
+        return None
 
 
 def mega_upload_text(text, remote_name):
@@ -123,25 +400,44 @@ def mega_upload_text(text, remote_name):
             os.unlink(tmp)
 
 
-def start_keepalive():
-    global _keepalive_started
-    if _keepalive_started or not KEEPALIVE_URL:
-        return
-    _keepalive_started = True
-    def _ping():
-        while True:
+def _ensure_keepalive():
+    global _active_tasks, _keepalive_thread
+    with _keepalive_lock:
+        _active_tasks += 1
+        if _keepalive_thread is None or not _keepalive_thread.is_alive():
+            _keepalive_thread = threading.Thread(target=_keepalive_loop, daemon=True)
+            _keepalive_thread.start()
+
+
+def _release_keepalive():
+    global _active_tasks
+    with _keepalive_lock:
+        _active_tasks -= 1
+        if _active_tasks < 0:
+            _active_tasks = 0
+
+
+def _keepalive_loop():
+    render_url = KEEPALIVE_URL
+    local_url = f"http://localhost:{os.environ.get('PORT', 10000)}"
+    while True:
+        with _keepalive_lock:
+            if _active_tasks <= 0:
+                break
+        success = False
+        if render_url:
             try:
-                requests.get(KEEPALIVE_URL, timeout=10)
+                requests.get(f"{render_url}/health", timeout=15)
+                success = True
             except Exception:
                 pass
-            time.sleep(300)
-    t = threading.Thread(target=_ping, daemon=True)
-    t.start()
-
-
-@app.before_request
-def _init_background():
-    start_keepalive()
+        if not success:
+            try:
+                requests.get(f"{local_url}/health", timeout=5)
+                success = True
+            except Exception:
+                pass
+        time.sleep(60)
 
 
 def detect_language(text):
@@ -160,10 +456,14 @@ def calculate_eta(task):
     elapsed = time.time() - task["start_time"]
     pages_done = task["current_page"]
     total = task["total_pages"]
+    start_offset = task.get("processing_start_page", 1)
     if total <= 0 or pages_done <= 0 or elapsed <= 0:
         return ""
-    pages_per_sec = pages_done / elapsed
-    remaining = (total - pages_done) / pages_per_sec if pages_per_sec > 0 else 0
+    relative_done = max(0, pages_done - start_offset + 1)
+    if relative_done <= 0:
+        return ""
+    pages_per_sec = relative_done / elapsed
+    remaining = max(0, total - relative_done) / pages_per_sec if pages_per_sec > 0 else 0
     if remaining < 60:
         return f"{int(remaining)}s"
     elif remaining < 3600:
@@ -194,14 +494,39 @@ def process_task(task_id, filepath, ext, lang, start_page, end_page, save_mega):
 
             page_num = max(1, start_page)
             while True:
+                if task.get("cancelled"):
+                    task["status"] = "cancelled"
+                    task["error"] = "Cancelled by user"
+                    return
+
                 if end_page is not None and page_num > end_page:
                     break
+
+                gc.collect()
+                mem = _get_memory_mb()
+                if mem > 400:
+                    logger.warning(f"Task {task_id}: RSS {mem}MB > 400MB, forcing GC")
+                    gc.collect()
+                    gc.collect()
+
                 try:
-                    images = convert_from_path(filepath, dpi=300, first_page=page_num, last_page=page_num)
+                    pool = ThreadPoolExecutor(max_workers=1)
+                    try:
+                        future = pool.submit(convert_from_path, filepath, dpi=300, first_page=page_num, last_page=page_num)
+                        images = future.result(timeout=CONVERT_TIMEOUT)
+                    except _CTimeoutError:
+                        logger.warning(f"Task {task_id}: Convert timeout on page {page_num}, skipping")
+                        images = None
+                    finally:
+                        pool.shutdown(wait=False)
+
                     if not images:
-                        break
+                        page_num += 1
+                        continue
+
                     page_text = pytesseract.image_to_string(images[0], lang=ocr_lang)
                     images[0].close()
+                    del images
                     if page_text.strip():
                         text_parts.append(f"--- Page {page_num} ---\n{page_text}")
                     task["current_page"] = page_num
@@ -212,6 +537,8 @@ def process_task(task_id, filepath, ext, lang, start_page, end_page, save_mega):
                         cp_text = "\n\n".join(text_parts)
                         mega_upload_text(cp_text, f"checkpoint_{task_id}_p{page_num}.txt")
                         last_mega_cp = page_num
+
+                    _save_progress()
 
                     page_num += 1
                 except Exception:
@@ -253,12 +580,25 @@ def process_task(task_id, filepath, ext, lang, start_page, end_page, save_mega):
             text = ""
             task["progress"] = 100
 
+        if task.get("cancelled"):
+            task["status"] = "cancelled"
+            task["error"] = "Cancelled by user"
+            _save_progress(force=True)
+            return
+
         if text.strip():
             if lang == "auto":
                 task["detected_language"] = detect_language(text)
             task["word_count"] = len(text.split())
             results[task_id] = text
             task["status"] = "completed"
+            output_path = task.get("output_path")
+            if output_path:
+                try:
+                    with open(output_path, 'w', encoding='utf-8') as f:
+                        f.write(text)
+                except Exception:
+                    pass
 
             if save_mega:
                 link = mega_upload_text(text, f"ocr_{task_id}.txt")
@@ -268,10 +608,14 @@ def process_task(task_id, filepath, ext, lang, start_page, end_page, save_mega):
             task["status"] = "failed"
             task["error"] = "No text could be extracted"
 
+        _save_progress(force=True)
+
     except Exception as e:
         task["status"] = "failed"
         task["error"] = str(e)
+        _save_progress(force=True)
     finally:
+        _release_keepalive()
         try:
             if os.path.exists(filepath):
                 os.unlink(filepath)
@@ -317,7 +661,8 @@ def task_page(task_id):
 
 
 def build_task_html(task):
-    status_icon = "\u23F3" if task["status"] == "processing" else ("\u2705" if task["status"] == "completed" else "\u274C")
+    task_id = task["task_id"]
+    status_icon = "\u23F3" if task["status"] in ("processing", "queued") else ("\u2705" if task["status"] == "completed" else "\u274C")
     status_text = task["status"].title()
     eta_text = task.get("eta", "")
     detected = task.get("detected_language", "")
@@ -327,19 +672,59 @@ def build_task_html(task):
 
     extra = ""
     if task["status"] == "completed":
-        extra = f'''<div style="margin-top:1.5rem;display:flex;gap:1rem;justify-content:center;flex-wrap:wrap;">
-            <a href="/download/{task_id}" class="btn btn-primary">\U0001F4E5 Download .txt</a>
-            <a href="/" class="btn btn-secondary">\U0001F504 Process Another</a>
+        extra = f'''<div class="progress-actions">
+            <a href="/download/{task_id}" class="btn btn-primary btn-sm">\U0001F4E5 Download .txt</a>
+            <a href="/" class="btn btn-secondary btn-sm">\U0001F504 Process Another</a>
         </div>'''
         if mega_link:
-            extra += f'''<p style="margin-top:0.8rem;"><a href="{mega_link}" target="_blank" style="color:var(--accent);font-weight:600;">\U0001F310 Download from Mega Cloud</a></p>'''
+            extra += f'''<p style="margin-top:0.8rem;text-align:center;"><a href="{mega_link}" target="_blank" style="color:var(--accent);font-weight:600;">\U0001F310 Download from Mega Cloud</a></p>'''
         if detected:
-            extra += f'<p style="color:#666;margin-top:0.5rem;">Detected language: <strong>{detected}</strong></p>'
+            extra += f'<p style="color:#666;margin-top:0.5rem;text-align:center;">Detected language: <strong>{detected}</strong></p>'
         if word_count:
-            extra += f'<p style="color:#666;">{word_count} words extracted</p>'
+            extra += f'<p style="color:#666;text-align:center;">{word_count} words extracted</p>'
     elif task["status"] == "failed":
-        extra = f'''<p style="color:#721c24;">Error: {task.get("error", "Unknown error")}</p>
-            <div style="margin-top:1rem;"><a href="/" class="btn btn-primary">\U0001F504 Try Again</a></div>'''
+        extra = f'''<p style="color:#721c24;text-align:center;">Error: {task.get("error", "Unknown error")}</p>
+            <div class="progress-actions">
+                <a href="/" class="btn btn-primary btn-sm">\U0001F504 Try Again</a>
+                <button class="btn btn-secondary btn-sm" onclick="retryTask('{task_id}')">\U0001F504 Retry</button>
+            </div>'''
+    elif task["status"] == "cancelled":
+        extra = f'''<p style="color:#856404;text-align:center;">Task was cancelled.</p>
+            <div class="progress-actions">
+                <a href="/" class="btn btn-primary btn-sm">\U0001F504 Upload Again</a>
+            </div>'''
+
+    cancel_btn = ""
+    if task["status"] in ("processing", "queued"):
+        cancel_btn = '''<div class="progress-actions">
+            <button class="btn btn-danger btn-sm" onclick="cancelTask()">\u2716 Cancel</button>
+            <a href="/downloads" class="btn btn-secondary btn-sm">\U0001F4E6 My Downloads</a>
+        </div>'''
+
+    polling_js = ""
+    if task["status"] in ("processing", "queued"):
+        polling_js = f'''<script>
+        function poll() {{
+            fetch("/progress/{task_id}").then(function(r){{return r.json()}}).then(function(d){{
+                if(d.found && (d.status==="processing"||d.status==="queued")){{
+                    var p=d.progress||0;
+                    document.querySelector(".progress-bar-fill").style.width=p+"%";
+                    document.querySelectorAll(".progress-stat")[1].querySelector(".value").textContent=p+"%";
+                    document.querySelectorAll(".progress-stat")[2].querySelector(".value").textContent=(d.current_page||0)+"/"+(d.total_pages||0);
+                    document.querySelectorAll(".progress-stat")[4].querySelector(".value").textContent=d.eta||"";
+                    setTimeout(poll,2000);
+                }} else if(d.found && (d.status==="completed"||d.status==="failed"||d.status==="cancelled")){{
+                    location.reload();
+                }}
+            }});
+        }}
+        function cancelTask() {{
+            fetch("/cancel/{task_id}",{{method:"POST"}}).then(function(r){{return r.json()}}).then(function(d){{
+                location.reload();
+            }});
+        }}
+        poll();
+        </script>'''
 
     return f'''<div class="container progress-page">
         <div class="card">
@@ -353,30 +738,93 @@ def build_task_html(task):
                 <div class="progress-stat"><div class="value">{eta_text}</div><div class="label">ETA</div></div>
             </div>
             <div class="progress-bar-bg"><div class="progress-bar-fill" style="width:{pct}%"></div></div>
+            {cancel_btn}
             {extra}
         </div>
     </div>
-    <script>
-    {'''(
-    function poll() {
-        fetch("/progress/'"'"' + task_id + "'"'"').then(r=>r.json()).then(d=>{
-            if(d.found && (d.status==="processing"||d.status==="queued")){
-                var p=d.progress||0;
-                document.querySelector(".progress-bar-fill").style.width=p+"%";
-                document.querySelectorAll(".progress-stat")[1].querySelector(".value").textContent=p+"%";
-                document.querySelectorAll(".progress-stat")[2].querySelector(".value").textContent=(d.current_page||0)+"/"+(d.total_pages||0);
-                document.querySelectorAll(".progress-stat")[4].querySelector(".value").textContent=d.eta||"";
-                setTimeout(poll,2000);
-            } else if(d.found && d.status==="completed"){
-                location.reload();
-            } else if(d.found && d.status==="failed"){
-                location.reload();
-            }
-        });
+    {polling_js}'''
+
+
+@app.route("/cancel/<task_id>", methods=['POST'])
+def cancel_task(task_id):
+    with tasks_lock:
+        task = tasks.get(task_id)
+        if not task:
+            return jsonify({"error": "Task not found"}), 404
+        if task["status"] not in ("processing", "queued", "starting"):
+            return jsonify({"error": "Task is not running"}), 400
+        task["cancelled"] = True
+    return jsonify({"status": "cancelling"}), 200
+
+
+@app.route("/retry/<task_id>", methods=['POST'])
+def retry_task(task_id):
+    with tasks_lock:
+        old = tasks.get(task_id)
+        if not old:
+            return jsonify({"error": "Task not found"}), 404
+        if old.get("status") not in ("failed", "cancelled"):
+            return jsonify({"error": "Only failed or cancelled tasks can be retried"}), 400
+        filename = old.get("filename", "input.pdf")
+        ext = old.get("ext", ".pdf")
+        lang = old.get("language", "auto")
+        start_page = old.get("start_page", 1)
+        end_page = old.get("end_page", None)
+
+    new_id = os.urandom(8).hex()
+    new_task = {
+        "task_id": new_id,
+        "filename": filename,
+        "ext": ext,
+        "language": lang,
+        "status": "queued",
+        "progress": 0,
+        "current_page": 0,
+        "total_pages": 0,
+        "word_count": 0,
+        "detected_language": old.get("detected_language", ""),
+        "language_display": old.get("language_display", LANG_OPTIONS.get(lang, lang)),
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "eta": "",
+        "start_time": time.time(),
+        "mega_link": "",
+        "start_page": start_page,
+        "end_page": end_page,
     }
-    poll();
-    )() if task["status"] in ("processing","queued") else ""'''}
-    </script>'''
+
+    with tasks_lock:
+        tasks[new_id] = new_task
+        tasks_order.insert(0, new_id)
+
+    flash("Retry task created. Please upload the file again.", "info")
+    return redirect(f"/task/{new_id}")
+
+
+@app.route("/preview/<task_id>")
+def preview_text(task_id):
+    text = results.get(task_id)
+    if text is None:
+        task = tasks.get(task_id)
+        output_path = task.get("output_path") if task else None
+        if output_path and os.path.exists(output_path):
+            try:
+                with open(output_path, 'r', encoding='utf-8', errors='replace') as f:
+                    text = f.read(2000)
+                return jsonify({"text": text[:2000]})
+            except Exception:
+                pass
+        return jsonify({"text": "Preview not available."})
+    return jsonify({"text": text[:2000]})
+
+
+@app.route("/health")
+def health():
+    try:
+        version = pytesseract.get_tesseract_version()
+        langs = pytesseract.get_languages()
+        return {"status": "healthy", "tesseract_version": str(version), "languages_available": langs}, 200
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}, 500
 
 
 @app.route("/downloads")
@@ -390,6 +838,7 @@ def downloads():
 
     processing = [t for t in all_tasks if t["status"] in ("processing", "queued")]
     completed = [t for t in all_tasks if t["status"] == "completed"]
+    cancelled = [t for t in all_tasks if t["status"] == "cancelled"]
     failed = [t for t in all_tasks if t["status"] == "failed"]
 
     parts = []
@@ -401,31 +850,33 @@ def downloads():
             tid = t["task_id"]
             rows += f'''<tr>
                 <td>{t["filename"]}</td>
-                <td>{"\u23F3"} {pct}%</td>
-                <td><span class="status-badge processing">{"\u23F3"} Processing</span></td>
-                <td><a href="/task/{tid}" class="btn btn-primary" style="padding:5px 14px;font-size:0.85rem;">View</a></td>
+                <td>\u23F3 {pct}%</td>
+                <td><span class="status-badge processing">\u23F3 Processing</span></td>
+                <td>{t.get("eta","")}</td>
+                <td class="actions"><a href="/task/{tid}" class="btn btn-primary btn-sm">View</a></td>
             </tr>'''
-        parts.append(f'''<h3 class="section-title">{"\u23F3"} Processing</h3>
-            <table class="download-table"><thead><tr><th>File</th><th>Progress</th><th>Status</th><th>Action</th></tr></thead>
-            <tbody>{rows}</tbody></table>''')
+        parts.append(f'''<h3 class="section-title">\u23F3 Processing</h3>
+            <div style="overflow-x:auto;"><table class="download-table"><thead><tr><th>File</th><th>Progress</th><th>Status</th><th>ETA</th><th>Action</th></tr></thead>
+            <tbody>{rows}</tbody></table></div>''')
 
     if completed:
         rows = ""
         for t in completed:
             tid = t["task_id"]
             mega_link = t.get("mega_link", "")
-            dl = f'<a href="/download/{tid}" class="btn btn-primary" style="padding:5px 14px;font-size:0.85rem;">{"\U0001F4E5"} Download</a>'
+            dl = f'<a href="/download/{tid}" class="btn btn-primary btn-sm">\U0001F4E5 Download</a>'
             if mega_link:
-                dl += f' <a href="{mega_link}" target="_blank" class="btn btn-secondary" style="padding:5px 10px;font-size:0.8rem;">{"\U0001F310"} Mega</a>'
+                dl += f' <a href="{mega_link}" target="_blank" class="btn btn-secondary btn-sm">\U0001F310 Mega</a>'
+            dl += f' <button class="btn btn-secondary btn-sm" onclick="previewText(\'{tid}\')">\U0001F50D Preview</button>'
             rows += f'''<tr>
                 <td>{t["filename"]}</td>
                 <td>{t["word_count"]}</td>
-                <td><span class="status-badge completed">{"\u2705"} Completed</span></td>
-                <td>{dl}</td>
+                <td><span class="status-badge completed">\u2705 Completed</span></td>
+                <td class="actions">{dl}</td>
             </tr>'''
-        parts.append(f'''<h3 class="section-title">{"\u2705"} Completed</h3>
-            <table class="download-table"><thead><tr><th>File</th><th>Words</th><th>Status</th><th>Action</th></tr></thead>
-            <tbody>{rows}</tbody></table>''')
+        parts.append(f'''<h3 class="section-title">\u2705 Completed</h3>
+            <div style="overflow-x:auto;"><table class="download-table"><thead><tr><th>File</th><th>Words</th><th>Status</th><th>Action</th></tr></thead>
+            <tbody>{rows}</tbody></table></div>''')
 
     if failed:
         rows = ""
@@ -433,13 +884,32 @@ def downloads():
             tid = t["task_id"]
             rows += f'''<tr>
                 <td>{t["filename"]}</td>
-                <td><span class="status-badge failed">{"\u274C"} Failed</span></td>
+                <td><span class="status-badge failed">\u274C Failed</span></td>
                 <td style="color:#721c24;font-size:0.85rem;">{t.get("error","")[:50]}</td>
-                <td><a href="/task/{tid}" class="btn btn-secondary" style="padding:5px 14px;font-size:0.85rem;">Details</a></td>
+                <td class="actions">
+                    <a href="/task/{tid}" class="btn btn-secondary btn-sm">Details</a>
+                    <button class="btn btn-primary btn-sm" onclick="retryTask('{tid}')">\U0001F504 Retry</button>
+                </td>
             </tr>'''
-        parts.append(f'''<h3 class="section-title">{"\u274C"} Failed</h3>
-            <table class="download-table"><thead><tr><th>File</th><th>Status</th><th>Error</th><th>Action</th></tr></thead>
-            <tbody>{rows}</tbody></table>''')
+        parts.append(f'''<h3 class="section-title">\u274C Failed</h3>
+            <div style="overflow-x:auto;"><table class="download-table"><thead><tr><th>File</th><th>Status</th><th>Error</th><th>Action</th></tr></thead>
+            <tbody>{rows}</tbody></table></div>''')
+
+    if cancelled:
+        rows = ""
+        for t in cancelled:
+            tid = t["task_id"]
+            rows += f'''<tr>
+                <td>{t["filename"]}</td>
+                <td><span class="status-badge interrupted">\u23F8 Cancelled</span></td>
+                <td></td>
+                <td class="actions">
+                    <button class="btn btn-primary btn-sm" onclick="retryTask('{tid}')">\U0001F504 Retry</button>
+                </td>
+            </tr>'''
+        parts.append(f'''<h3 class="section-title">\u23F8 Cancelled</h3>
+            <div style="overflow-x:auto;"><table class="download-table"><thead><tr><th>File</th><th>Status</th><th>Error</th><th>Action</th></tr></thead>
+            <tbody>{rows}</tbody></table></div>''')
 
     if not parts:
         content = '''<div class="container">
@@ -453,7 +923,36 @@ def downloads():
         content = f'''<div class="container">
             <div class="page-title"><h2>\U0001F4E6 Downloads</h2></div>
             <div class="card">{"".join(parts)}</div>
-        </div>'''
+        </div>
+        <div id="preview-modal" class="modal-overlay">
+            <div class="modal-content">
+                <button class="modal-close" onclick="closePreview()">&times;</button>
+                <h3>\U0001F50D Preview</h3>
+                <pre id="preview-text">Loading...</pre>
+            </div>
+        </div>
+        <script>
+        function previewText(tid) {{
+            document.getElementById("preview-text").textContent = "Loading...";
+            document.getElementById("preview-modal").classList.add("active");
+            fetch("/preview/"+tid).then(function(r){{return r.json()}}).then(function(d){{
+                document.getElementById("preview-text").textContent = d.text || "No preview available.";
+            }});
+        }}
+        function closePreview() {{
+            document.getElementById("preview-modal").classList.remove("active");
+        }}
+        document.getElementById("preview-modal").addEventListener("click", function(e) {{
+            if(e.target === this) closePreview();
+        }});
+        function retryTask(tid) {{
+            if(!confirm("Create a retry task for this file?")) return;
+            fetch("/retry/"+tid, {{method:"POST"}}).then(function(r){{
+                if(r.redirected) {{ window.location.href = r.url; }}
+                else {{ location.reload(); }}
+            }});
+        }}
+        </script>'''
 
     return render_page("Downloads", content, "downloads")
 
@@ -461,6 +960,15 @@ def downloads():
 @app.route("/download/<task_id>")
 def download_file(task_id):
     text = results.get(task_id)
+    if text is None:
+        task = tasks.get(task_id)
+        output_path = task.get("output_path") if task else None
+        if output_path and os.path.exists(output_path):
+            try:
+                with open(output_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+            except Exception:
+                pass
     if text is None:
         flash("Download not found or expired.", "error")
         return redirect("/downloads")
@@ -522,11 +1030,23 @@ def index():
             "eta": "",
             "start_time": time.time(),
             "mega_link": "",
+            "start_page": sp,
+            "end_page": ep,
+            "cancelled": False,
         }
+
+        if ext == ".pdf" and (MEGA_AVAILABLE and MEGA_EMAIL and MEGA_PASSWORD):
+            try:
+                output_dir = tempfile.mkdtemp()
+                output_path = os.path.join(output_dir, f"ocr_{task_id}.txt")
+                task["output_path"] = output_path
+            except Exception:
+                pass
 
         with tasks_lock:
             tasks[task_id] = task
             tasks_order.insert(0, task_id)
+        _save_progress()
 
         t = threading.Thread(
             target=process_task,
@@ -534,6 +1054,7 @@ def index():
             daemon=True,
         )
         t.start()
+        _ensure_keepalive()
 
         return redirect(f"/task/{task_id}")
 
@@ -576,25 +1097,6 @@ def index():
                 <button type="submit" class="upload-btn" id="submit-btn">\U0001F4E4 Upload &amp; Extract</button>
             </form>
         </div>
-        <div class="card">
-            <h2>\U0001F4A1 How It Works</h2>
-            <p>Select a document type, upload your file, and our OCR engine extracts text in the background. You can close the page and come back later.</p>
-            <div class="tip-box" style="margin-top:1.5rem;">
-                <h4><span class="tip-icon">\u26A1</span> Pro Tip</h4>
-                <p>Use Auto Detect for mixed Tamil + English documents. Set page range to process specific PDF pages. Enable Mega Cloud to get a shareable download link.</p>
-            </div>
-        </div>
-        <div class="card">
-            <h2>\U0001F4E6 Supported Formats</h2>
-            <div class="formats-grid">
-                <div class="format-card">PDF Documents</div>
-                <div class="format-card">PNG / JPEG / WEBP</div>
-                <div class="format-card">TIFF / BMP / GIF</div>
-                <div class="format-card">Word (DOCX)</div>
-                <div class="format-card">Excel (XLSX)</div>
-                <div class="format-card">CSV / TXT / JSON</div>
-            </div>
-        </div>
     </div>
     <script>
     (function(){{
@@ -625,6 +1127,65 @@ def index():
 
     return render_page("Upload", content, "upload")
 
+
+@app.errorhandler(413)
+def too_large(e):
+    flash("File too large. Maximum size is 200MB.", "error")
+    return redirect("/")
+
+
+def _startup_resume():
+    time.sleep(5)
+    with app.app_context():
+        saved = _load_progress()
+        restored = 0
+        with tasks_lock:
+            for tid, data in saved.items():
+                if tid not in tasks:
+                    data["status"] = "interrupted" if data.get("status") not in ("completed", "failed") else data["status"]
+                    if "cancelled" in data and data.get("cancelled"):
+                        data["status"] = "cancelled"
+                    data["start_time"] = time.time()
+                    data["eta"] = ""
+                    data["mega_link"] = data.get("mega_link", "")
+                    tasks[tid] = data
+                    tasks_order.append(tid)
+                    restored += 1
+        if restored:
+            _save_progress(force=True)
+            logger.info(f"Startup: restored {restored} tasks from {PROGRESS_FILE}")
+
+
+def _cleanup_loop():
+    while True:
+        time.sleep(3600)
+        try:
+            now = time.time()
+            to_delete = []
+            with tasks_lock:
+                for tid, task in tasks.items():
+                    if task.get("status") == "completed" and "created_at" in task:
+                        try:
+                            ct = datetime.strptime(task["created_at"], "%Y-%m-%d %H:%M").timestamp()
+                            if now - ct > 86400:
+                                to_delete.append(tid)
+                        except Exception:
+                            pass
+            for tid in to_delete:
+                with tasks_lock:
+                    tasks.pop(tid, None)
+                    results.pop(tid, None)
+                    if tid in tasks_order:
+                        tasks_order.remove(tid)
+            if to_delete:
+                _save_progress()
+                logger.info(f"Cleanup: removed {len(to_delete)} old completed tasks")
+        except Exception:
+            pass
+
+
+threading.Thread(target=_startup_resume, daemon=True).start()
+threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))

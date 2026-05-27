@@ -26,4 +26,4 @@ WORKDIR /app
 ENV PORT=10000
 EXPOSE 10000
 
-CMD gunicorn --bind 0.0.0.0:${PORT} app:app
+CMD gunicorn --bind 0.0.0.0:${PORT} --workers 1 --timeout 900 app:app

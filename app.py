@@ -46,6 +46,11 @@ try:
 except ImportError:
     load_workbook = None
 
+try:
+    from PyPDF2 import PdfReader
+except ImportError:
+    PdfReader = None
+
 BATCH_SIZE = 1
 CHECKPOINT_INTERVAL = 5
 MEGA_LOGIN_TIMEOUT = 30
@@ -482,14 +487,13 @@ def calculate_eta(task):
     elapsed = time.time() - task["start_time"]
     pages_done = task["current_page"]
     total = task["total_pages"]
-    start_offset = task.get("processing_start_page", 1)
-    if total <= 0 or pages_done <= 0 or elapsed <= 0:
+    if pages_done <= 0 or elapsed <= 0:
         return ""
-    relative_done = max(0, pages_done - start_offset + 1)
-    if relative_done <= 0:
-        return ""
-    pages_per_sec = relative_done / elapsed
-    remaining = max(0, total - relative_done) / pages_per_sec if pages_per_sec > 0 else 0
+    secs_per_page = elapsed / pages_done
+    if total > 0:
+        remaining = max(0, total - pages_done) * secs_per_page
+    else:
+        remaining = secs_per_page * 50
     if remaining < 60:
         return f"{int(remaining)}s"
     elif remaining < 3600:
@@ -517,6 +521,12 @@ def process_task(task_id, filepath, ext, lang, start_page, end_page, save_mega):
                 task["total_pages"] = info["pages"]
             except Exception:
                 task["total_pages"] = 0
+            if task["total_pages"] == 0 and PdfReader:
+                try:
+                    reader = PdfReader(filepath)
+                    task["total_pages"] = len(reader.pages)
+                except Exception:
+                    pass
 
             page_num = max(1, start_page)
             no_more_pages = False

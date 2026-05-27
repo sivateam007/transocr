@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip install --no-cache-dir \
     pytesseract pdf2image Pillow flask gunicorn requests \
-    python-docx openpyxl \
+    python-docx openpyxl PyPDF2 \
     && pip install --no-cache-dir --no-deps mega.py==1.0.8
 
 COPY app.py /app/app.py

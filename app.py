@@ -502,9 +502,18 @@ def calculate_eta(task):
         return f"{int(remaining//3600)}h {int((remaining%3600)//60)}m"
 
 
+def _ocr_keepalive_ping():
+    try:
+        local = f"http://localhost:{os.environ.get('PORT', 10000)}"
+        requests.get(f"{local}/health", timeout=5)
+    except Exception:
+        pass
+
+
 def process_task(task_id, filepath, ext, lang, start_page, end_page, save_mega):
     task = tasks.get(task_id)
     if not task:
+        _release_keepalive()
         return
     try:
         task["status"] = "processing"
@@ -514,6 +523,7 @@ def process_task(task_id, filepath, ext, lang, start_page, end_page, save_mega):
         text_parts = []
         mega_cp = save_mega
         last_mega_cp = 0
+        original_uploaded = False
 
         if ext == ".pdf":
             try:
@@ -527,6 +537,18 @@ def process_task(task_id, filepath, ext, lang, start_page, end_page, save_mega):
                     task["total_pages"] = len(reader.pages)
                 except Exception:
                     pass
+
+            if save_mega and not original_uploaded:
+                try:
+                    m = init_mega()
+                    if m:
+                        folder = ensure_mega_folder(m, "ocr-originals")
+                        if folder:
+                            m.upload(filepath, dest=folder, dest_filename=task["filename"])
+                            original_uploaded = True
+                            logger.info(f"Task {task_id}: Original uploaded to ocr-originals")
+                except Exception as e:
+                    logger.warning(f"Task {task_id}: Original upload failed: {e}")
 
             page_num = max(1, start_page)
             no_more_pages = False
@@ -546,7 +568,7 @@ def process_task(task_id, filepath, ext, lang, start_page, end_page, save_mega):
                 gc.collect()
                 mem = _get_memory_mb()
                 if mem > 400:
-                    logger.warning(f"Task {task_id}: RSS {mem}MB > 400MB, forcing GC")
+                    logger.warning(f"Task {task_id}: RSS {mem}MB > 400MB, forcing aggressive GC")
                     gc.collect()
                     gc.collect()
 
@@ -580,6 +602,7 @@ def process_task(task_id, filepath, ext, lang, start_page, end_page, save_mega):
                     page_text = pytesseract.image_to_string(images[0], lang=ocr_lang)
                     images[0].close()
                     del images
+                    gc.collect()
                     if page_text.strip():
                         text_parts.append(f"--- Page {page_num} ---\n{page_text}")
                     task["current_page"] = page_num
@@ -590,9 +613,15 @@ def process_task(task_id, filepath, ext, lang, start_page, end_page, save_mega):
                         cp_text = "\n\n".join(text_parts)
                         mega_checkpoint_upload(task_id, cp_text, page_num)
                         last_mega_cp = page_num
+                        _ocr_keepalive_ping()
+
+                    if page_num > 0 and page_num % 10 == 0:
+                        mem2 = _get_memory_mb()
+                        if mem2:
+                            logger.info(f"Task {task_id}: Page {page_num} done, RSS ~{mem2}MB")
+                        _ocr_keepalive_ping()
 
                     _save_progress()
-
                     page_num += 1
                 except Exception:
                     break

@@ -1118,7 +1118,11 @@ def index():
                 fileInput.value = "";
                 fileName.textContent = "";
                 fileArea.classList.remove("has-file");
+                fileInput.click();
             }});
+        }});
+        fileArea.addEventListener("click",function(){{
+            fileInput.click();
         }});
         fileInput.addEventListener("change",function(){{
             if(this.files && this.files[0]){{

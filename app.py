@@ -404,6 +404,28 @@ def mega_upload_text(text, remote_name):
             os.unlink(tmp)
 
 
+def mega_checkpoint_upload(task_id, text, page_num):
+    m = init_mega()
+    if not m:
+        return None
+    folder = ensure_mega_folder(m, "ocr-checkpoints")
+    if not folder:
+        return None
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
+            f.write(text)
+            tmp = f.name
+        file = m.upload(tmp, dest=folder, dest_filename=f"{task_id}_p{page_num}.txt")
+        return m.get_link(file)
+    except Exception as e:
+        logger.warning(f"Checkpoint upload failed: {e}")
+        return None
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
 def _ensure_keepalive():
     global _active_tasks, _keepalive_thread
     with _keepalive_lock:
@@ -554,9 +576,9 @@ def process_task(task_id, filepath, ext, lang, start_page, end_page, save_mega):
                     task["progress"] = int((page_num / task["total_pages"]) * 100) if task["total_pages"] > 0 else min(page_num, 99)
                     task["eta"] = calculate_eta(task)
 
-                    if save_mega and (page_num - last_mega_cp) >= 10:
+                    if save_mega and (page_num - last_mega_cp) >= 5:
                         cp_text = "\n\n".join(text_parts)
-                        mega_upload_text(cp_text, f"checkpoint_{task_id}_p{page_num}.txt")
+                        mega_checkpoint_upload(task_id, cp_text, page_num)
                         last_mega_cp = page_num
 
                     _save_progress()
@@ -622,9 +644,19 @@ def process_task(task_id, filepath, ext, lang, start_page, end_page, save_mega):
                     pass
 
             if save_mega:
-                link = mega_upload_text(text, f"ocr_{task_id}.txt")
-                if link:
-                    task["mega_link"] = link
+                tmp_out = None
+                try:
+                    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
+                        f.write(text)
+                        tmp_out = f.name
+                    link = upload_to_mega(tmp_out, f"ocr_{task_id}.txt")
+                    if link:
+                        task["mega_link"] = link
+                except Exception:
+                    pass
+                finally:
+                    if tmp_out and os.path.exists(tmp_out):
+                        os.unlink(tmp_out)
         else:
             task["status"] = "failed"
             task["error"] = "No text could be extracted"

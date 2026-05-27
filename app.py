@@ -497,13 +497,18 @@ def process_task(task_id, filepath, ext, lang, start_page, end_page, save_mega):
                 task["total_pages"] = 0
 
             page_num = max(1, start_page)
+            no_more_pages = False
             while True:
                 if task.get("cancelled"):
                     task["status"] = "cancelled"
                     task["error"] = "Cancelled by user"
+                    _save_progress(force=True)
                     return
 
                 if end_page is not None and page_num > end_page:
+                    break
+
+                if no_more_pages:
                     break
 
                 gc.collect()
@@ -513,6 +518,8 @@ def process_task(task_id, filepath, ext, lang, start_page, end_page, save_mega):
                     gc.collect()
                     gc.collect()
 
+                images = None
+                timed_out = False
                 try:
                     pool = ThreadPoolExecutor(max_workers=1)
                     try:
@@ -520,13 +527,23 @@ def process_task(task_id, filepath, ext, lang, start_page, end_page, save_mega):
                         images = future.result(timeout=CONVERT_TIMEOUT)
                     except _CTimeoutError:
                         logger.warning(f"Task {task_id}: Convert timeout on page {page_num}, skipping")
-                        images = None
+                        timed_out = True
                     finally:
                         pool.shutdown(wait=False)
 
-                    if not images:
+                    if task.get("cancelled"):
+                        task["status"] = "cancelled"
+                        task["error"] = "Cancelled by user"
+                        _save_progress(force=True)
+                        return
+
+                    if timed_out:
                         page_num += 1
                         continue
+
+                    if images is None or len(images) == 0:
+                        no_more_pages = True
+                        break
 
                     page_text = pytesseract.image_to_string(images[0], lang=ocr_lang)
                     images[0].close()
@@ -534,7 +551,7 @@ def process_task(task_id, filepath, ext, lang, start_page, end_page, save_mega):
                     if page_text.strip():
                         text_parts.append(f"--- Page {page_num} ---\n{page_text}")
                     task["current_page"] = page_num
-                    task["progress"] = int((page_num / task["total_pages"]) * 100) if task["total_pages"] > 0 else 0
+                    task["progress"] = int((page_num / task["total_pages"]) * 100) if task["total_pages"] > 0 else min(page_num, 99)
                     task["eta"] = calculate_eta(task)
 
                     if save_mega and (page_num - last_mega_cp) >= 10:
@@ -638,6 +655,8 @@ def progress_api(task_id):
     task = tasks.get(task_id)
     if not task:
         return jsonify({"found": False})
+    tp = task["total_pages"]
+    display_total = tp if tp > 0 else "?"
     return jsonify({
         "found": True,
         "task_id": task["task_id"],
@@ -645,7 +664,8 @@ def progress_api(task_id):
         "status": task["status"],
         "progress": task["progress"],
         "current_page": task["current_page"],
-        "total_pages": task["total_pages"],
+        "total_pages": tp,
+        "display_total": str(display_total),
         "language_display": task.get("language_display", ""),
         "detected_language": task.get("detected_language", ""),
         "word_count": task["word_count"],
@@ -714,7 +734,7 @@ def build_task_html(task):
                     var p=d.progress||0;
                     document.querySelector(".progress-bar-fill").style.width=p+"%";
                     document.querySelectorAll(".progress-stat")[1].querySelector(".value").textContent=p+"%";
-                    document.querySelectorAll(".progress-stat")[2].querySelector(".value").textContent=(d.current_page||0)+"/"+(d.total_pages||0);
+                    document.querySelectorAll(".progress-stat")[2].querySelector(".value").textContent=(d.current_page||0)+"/"+(d.display_total||"?")
                     document.querySelectorAll(".progress-stat")[4].querySelector(".value").textContent=d.eta||"";
                     setTimeout(poll,2000);
                 }} else if(d.found && (d.status==="completed"||d.status==="failed"||d.status==="cancelled")){{
@@ -737,7 +757,7 @@ def build_task_html(task):
             <div class="progress-status">
                 <div class="progress-stat"><div class="value">{status_icon}</div><div class="label">Status</div></div>
                 <div class="progress-stat"><div class="value">{pct}%</div><div class="label">Progress</div></div>
-                <div class="progress-stat"><div class="value">{task["current_page"]}/{task["total_pages"]}</div><div class="label">Pages</div></div>
+                <div class="progress-stat"><div class="value">{task["current_page"]}/{task["total_pages"] if task["total_pages"] > 0 else "?"}</div><div class="label">Pages</div></div>
                 <div class="progress-stat"><div class="value">{task.get("language_display","")}</div><div class="label">Language</div></div>
                 <div class="progress-stat"><div class="value">{eta_text}</div><div class="label">ETA</div></div>
             </div>

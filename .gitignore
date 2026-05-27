@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+*.pdf
+*.txt
+*.jpg
+*.png
+*.jpeg
+poppler-*/
+.DS_Store

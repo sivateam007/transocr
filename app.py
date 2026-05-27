@@ -25,6 +25,10 @@ gc.set_threshold(100, 5, 2)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+import asyncio
+if not hasattr(asyncio, 'coroutine'):
+    asyncio.coroutine = lambda f: f
+
 MEGA_AVAILABLE = False
 try:
     from mega import Mega

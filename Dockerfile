@@ -17,8 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \
-    pytesseract pdf2image Pillow flask gunicorn \
-    python-docx openpyxl
+    pytesseract pdf2image Pillow flask gunicorn requests \
+    python-docx openpyxl mega.py
 
 COPY app.py /app/app.py
 WORKDIR /app

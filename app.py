@@ -1986,6 +1986,42 @@ def too_large(e):
     return redirect(url_for('index'))
 
 
+@app.route('/clear-downloads', methods=['POST'])
+def clear_downloads():
+    data = request.get_json(silent=True) or {}
+    task_ids = data.get("task_ids")
+    cleared = 0
+    with progress_lock:
+        if task_ids:
+            for tid in task_ids:
+                if tid in progress_tracker:
+                    task = progress_tracker[tid]
+                    op = task.get("output_path")
+                    if op and os.path.exists(op):
+                        try: os.remove(op)
+                        except: pass
+                    td = task.get("temp_dir")
+                    if td:
+                        shutil.rmtree(td, ignore_errors=True)
+                    del progress_tracker[tid]
+                    cleared += 1
+        else:
+            for tid in list(progress_tracker.keys()):
+                task = progress_tracker[tid]
+                op = task.get("output_path")
+                if op and os.path.exists(op):
+                    try: os.remove(op)
+                    except: pass
+                td = task.get("temp_dir")
+                if td:
+                    shutil.rmtree(td, ignore_errors=True)
+                del progress_tracker[tid]
+                cleared += 1
+    if cleared:
+        _save_progress(True)
+    return jsonify({"cleared": cleared}), 200
+
+
 @app.route('/downloads')
 def downloads_page():
     all_tasks = []

@@ -26,10 +26,15 @@
             <h2><i class="fas fa-download"></i> My Downloads</h2>
 
             {% if downloads %}
-            <div style="overflow-x: auto; margin-top: 2rem;">
+            <div style="margin-top: 2rem; display: flex; gap: 0.5rem; flex-wrap: wrap;">
+                <button onclick="clearDownloads()" style="padding: 0.6rem 1.2rem; background: #dc2626; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600;"><i class="fas fa-trash-alt"></i> Clear All</button>
+                <button id="clear-selected-btn" onclick="clearSelected()" disabled style="padding: 0.6rem 1.2rem; background: #999; color: white; border: none; border-radius: 6px; cursor: not-allowed; font-weight: 600;"><i class="fas fa-check-double"></i> Clear Selected</button>
+            </div>
+            <div style="overflow-x: auto; margin-top: 1rem;">
                 <table style="width: 100%; border-collapse: collapse;">
                     <thead>
                         <tr style="border-bottom: 2px solid var(--git-color);">
+                            <th style="padding: 1rem; text-align: left; width: 40px;"><input type="checkbox" id="select-all" onchange="toggleAll(this)"></th>
                             <th style="padding: 1rem; text-align: left;">#</th>
                             <th style="padding: 1rem; text-align: left;">File</th>
                             <th style="padding: 1rem; text-align: left;">Date</th>
@@ -45,6 +50,7 @@
                     <tbody>
                         {% for d in downloads %}
                         <tr style="border-bottom: 1px solid #eee;">
+                            <td style="padding: 1rem; text-align: center;"><input type="checkbox" class="task-checkbox" value="{{ d.task_id }}" onchange="updateClearSelected()"></td>
                             <td style="padding: 1rem;">{{ loop.index }}</td>
                             <td style="padding: 1rem;">{{ d.filename }}</td>
                             <td style="padding: 1rem; white-space: nowrap;">
@@ -160,6 +166,46 @@
     <script>
         function trackDownload(taskId) {
             fetch('/track-download/' + taskId, { method: 'POST' }).catch(function(){});
+        }
+
+        function toggleAll(src) {
+            document.querySelectorAll('.task-checkbox').forEach(cb => cb.checked = src.checked);
+            updateClearSelected();
+        }
+
+        function updateClearSelected() {
+            var checked = document.querySelectorAll('.task-checkbox:checked').length;
+            var btn = document.getElementById('clear-selected-btn');
+            if (checked > 0) {
+                btn.disabled = false;
+                btn.style.background = '#dc2626';
+                btn.style.cursor = 'pointer';
+                btn.innerHTML = '<i class="fas fa-check-double"></i> Clear Selected (' + checked + ')';
+            } else {
+                btn.disabled = true;
+                btn.style.background = '#999';
+                btn.style.cursor = 'not-allowed';
+                btn.innerHTML = '<i class="fas fa-check-double"></i> Clear Selected';
+            }
+        }
+
+        function clearDownloads() {
+            if (!confirm('Clear ALL downloads? This cannot be undone.')) return;
+            fetch('/clear-downloads', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({}) })
+                .then(r => r.json())
+                .then(d => { if (d.cleared > 0) location.reload(); })
+                .catch(function(){});
+        }
+
+        function clearSelected() {
+            var checked = document.querySelectorAll('.task-checkbox:checked');
+            if (checked.length === 0) return;
+            if (!confirm('Clear ' + checked.length + ' selected download' + (checked.length > 1 ? 's' : '') + '? This cannot be undone.')) return;
+            var ids = Array.from(checked).map(cb => cb.value);
+            fetch('/clear-downloads', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({task_ids: ids}) })
+                .then(r => r.json())
+                .then(d => { if (d.cleared > 0) location.reload(); })
+                .catch(function(){});
         }
 
         function openPreview(taskId) {

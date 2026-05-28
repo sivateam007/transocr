@@ -1141,7 +1141,7 @@ def upload_to_mega(local_file_path, remote_filename):
     logger.info(f"Uploading {remote_filename} to Mega.nz...")
     logger.info(f"File size: {os.path.getsize(local_file_path)} bytes")
     try:
-        file_node = mega_call(m, "upload", local_file_path, dest=dest, timeout=120)
+        file_node = mega_call(m, "upload", local_file_path, dest=dest, dest_filename=remote_filename, timeout=120)
     except Exception:
         logger.warning("Mega upload failed")
         return None
@@ -1160,6 +1160,7 @@ def rebuild_completed_from_mega():
     email = os.environ.get("MEGA_EMAIL")
     password = os.environ.get("MEGA_PWD")
     if not email or not password:
+        logger.info("MEGA_EMAIL/MEGA_PWD not set — skipping Mega restore scan")
         return
 
     try:
@@ -1170,14 +1171,17 @@ def rebuild_completed_from_mega():
         if isinstance(folder, (list, tuple)):
             folder = folder[0] if folder else None
         if not folder:
+            logger.info("No ocr-outputs folder found in Mega — nothing to restore")
             return
 
         try:
             files = mega_call(m, "get_files_in_node", folder, timeout=15)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Mega get_files_in_node failed: {e}")
             return
 
         if not files:
+            logger.info("Mega ocr-outputs folder is empty — nothing to restore")
             return
 
         now = time.time()
@@ -1189,7 +1193,7 @@ def rebuild_completed_from_mega():
             if not name.endswith('_ocr.txt') or name.startswith('_'):
                 continue
 
-            import hashlib
+            hashlib = __import__('hashlib')
             tid = "mega_" + hashlib.md5(name.encode()).hexdigest()[:12]
 
             with progress_lock:
@@ -1200,7 +1204,7 @@ def rebuild_completed_from_mega():
             if not link:
                 continue
 
-            orig_name = name[:-8]  # Remove '_ocr.txt'
+            orig_name = name[:-8].rstrip('_')  # Remove '_ocr.txt' + trailing underscore
             with progress_lock:
                 progress_tracker[tid] = {
                     "current_page": 0, "status": "completed",
@@ -1214,8 +1218,7 @@ def rebuild_completed_from_mega():
                 }
                 restored += 1
 
-        if restored:
-            logger.info(f"Restored {restored} completed tasks from Mega folder")
+        logger.info(f"Mega restore scan complete: {restored} tasks restored")
     except Exception as e:
         logger.error(f"Failed to scan Mega for completed tasks: {e}")
 

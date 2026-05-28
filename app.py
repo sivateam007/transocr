@@ -772,7 +772,7 @@ def process_file_background(task_id, file_path, filename, temp_dir, selected_lan
                                 progress_tracker[task_id]["error"] = "Cancelled by user"
                                 cancelled_flag = True
                     if cancelled_flag:
-                        _save_progress()
+                        _save_progress(True)
                         return
                     
                     batch_end = min(current + BATCH_SIZE - 1, actual_end) if actual_end else current + BATCH_SIZE - 1
@@ -856,7 +856,7 @@ def process_file_background(task_id, file_path, filename, temp_dir, selected_lan
                         progress_tracker[task_id]["error"] = "Cancelled by user"
                         cancelled_here = True
                 if cancelled_here:
-                    _save_progress()
+                    _save_progress(True)
                     return
 
             # Verify output file has content
@@ -865,7 +865,7 @@ def process_file_background(task_id, file_path, filename, temp_dir, selected_lan
                 with progress_lock:
                     progress_tracker[task_id]["status"] = "error"
                     progress_tracker[task_id]["error"] = "No text could be extracted"
-                _save_progress()
+                _save_progress(True)
                 return
             
             # Update tracker with success (check cancel race)
@@ -877,7 +877,7 @@ def process_file_background(task_id, file_path, filename, temp_dir, selected_lan
                     progress_tracker[task_id]["status"] = "completed"
                     progress_tracker[task_id]["pages_processed"] = pages_processed
                     progress_tracker[task_id]["percentage"] = 100
-            _save_progress()
+            _save_progress(True)
             logger.info(f"Task {task_id}: OCR completed successfully")
             
         elif file_type == 'image':
@@ -1063,7 +1063,7 @@ def process_file_background(task_id, file_path, filename, temp_dir, selected_lan
                 progress_tracker[task_id]["status"] = "completed"
             progress_tracker[task_id]["completed_at"] = time.time()
             progress_tracker[task_id]["download_count"] = progress_tracker[task_id].get("download_count", 0)
-        _save_progress()
+        _save_progress(True)
             
     except Exception as e:
         logger.error(f"Task {task_id}: Error - {str(e)}")
@@ -1072,7 +1072,7 @@ def process_file_background(task_id, file_path, filename, temp_dir, selected_lan
         with progress_lock:
             progress_tracker[task_id]["status"] = "error"
             progress_tracker[task_id]["error"] = str(e)
-        _save_progress()
+        _save_progress(True)
     finally:
         _release_keepalive()
 
@@ -1718,7 +1718,7 @@ def index():
                 "file_type": file_type,
                 "cancelled": False
             }
-        _save_progress()
+        _save_progress(True)
         
         # Start background processing thread
         logger.info(f"Starting background thread for task {task_id}, type: {file_type}")
@@ -1869,7 +1869,7 @@ def cancel_task(task_id):
             return jsonify({"error": "Task is not running"}), 400
         task["cancelled"] = True
         task["status"] = "cancelling"
-    _save_progress()
+    _save_progress(True)
     logger.info(f"Task {task_id}: Cancel requested")
     return jsonify({"status": "cancelling"}), 200
 
@@ -1951,7 +1951,7 @@ def retry_task(task_id):
             "cancelled": False,
             "retry_of": task_id
         }
-    _save_progress()
+    _save_progress(True)
 
     thread = threading.Thread(
         target=process_file_background,
@@ -2030,29 +2030,29 @@ def downloads_page():
 
 
 
-# Startup: scan Mega for incomplete tasks and resume them
+# Load persisted progress IMMEDIATELY (before first request can arrive)
+saved = _load_progress()
+if saved:
+    for tid, data in saved.items():
+        if data.get("status") not in ("completed", "error", "cancelled"):
+            data["status"] = "interrupted"
+        progress_tracker[tid] = data
+    logger.info(f"Restored {len(saved)} persisted tasks from {PROGRESS_FILE}")
+
+# Delayed startup: fix output_paths, scan Mega, resume checkpoints
 def _startup_resume():
-    time.sleep(10)  # Wait for server to be ready
+    time.sleep(10)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     with app.app_context():
-        # Load persisted progress from JSON file
-        saved = _load_progress()
-        if saved:
-            with progress_lock:
-                for tid, data in saved.items():
-                    # Preserve cancelled/error status; rest become interrupted
-                    if data.get("status") not in ("completed", "error", "cancelled"):
-                        data["status"] = "interrupted"
-                    # Fix output_path for completed tasks if local file exists
-                    if data.get("status") == "completed":
-                        op = data.get("output_path")
-                        if op and not os.path.exists(op):
-                            out_fn = data.get("output_filename")
-                            alt = os.path.join(OUTPUT_DIR, f"{tid}_{out_fn}") if out_fn else None
-                            if alt and os.path.exists(alt):
-                                data["output_path"] = alt
-                    progress_tracker[tid] = data
-            logger.info(f"Restored {len(saved)} persisted tasks from {PROGRESS_FILE}")
+        with progress_lock:
+            for tid, data in progress_tracker.items():
+                if data.get("status") == "completed":
+                    op = data.get("output_path")
+                    if op and not os.path.exists(op):
+                        out_fn = data.get("output_filename")
+                        alt = os.path.join(OUTPUT_DIR, f"{tid}_{out_fn}") if out_fn else None
+                        if alt and os.path.exists(alt):
+                            data["output_path"] = alt
         scan_and_resume_checkpoints()
         rebuild_completed_from_mega()
         rebuild_completed_from_local()

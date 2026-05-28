@@ -2079,9 +2079,8 @@ if saved:
 # Also scan local ocr-outputs/ — survives Render restarts where JSON is lost
 rebuild_completed_from_local()
 
-# Delayed startup: fix output_paths, scan Mega, resume checkpoints
+# Background startup: fix output_paths, scan Mega, resume checkpoints
 def _startup_resume():
-    time.sleep(10)
     with app.app_context():
         with progress_lock:
             for tid, data in progress_tracker.items():

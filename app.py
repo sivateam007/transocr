@@ -2066,7 +2066,7 @@ def downloads_page():
 
 
 
-# Load persisted progress IMMEDIATELY (before first request can arrive)
+# Load persisted progress and scan cloud storage BEFORE first request
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 saved = _load_progress()
 if saved:
@@ -2076,26 +2076,20 @@ if saved:
         progress_tracker[tid] = data
     logger.info(f"Restored {len(saved)} persisted tasks from {PROGRESS_FILE}")
 
-# Also scan local ocr-outputs/ — survives Render restarts where JSON is lost
 rebuild_completed_from_local()
+rebuild_completed_from_mega()
+scan_and_resume_checkpoints()
 
-# Background startup: fix output_paths, scan Mega, resume checkpoints
-def _startup_resume():
-    with app.app_context():
-        with progress_lock:
-            for tid, data in progress_tracker.items():
-                if data.get("status") == "completed":
-                    op = data.get("output_path")
-                    if op and not os.path.exists(op):
-                        out_fn = data.get("output_filename")
-                        alt = os.path.join(OUTPUT_DIR, f"{tid}_{out_fn}") if out_fn else None
-                        if alt and os.path.exists(alt):
-                            data["output_path"] = alt
-        scan_and_resume_checkpoints()
-        rebuild_completed_from_mega()
-        rebuild_completed_from_local()
-
-threading.Thread(target=_startup_resume, daemon=True).start()
+# Fix output_path for completed tasks whose local file exists
+with progress_lock:
+    for tid, data in progress_tracker.items():
+        if data.get("status") == "completed":
+            op = data.get("output_path")
+            if op and not os.path.exists(op):
+                out_fn = data.get("output_filename")
+                alt = os.path.join(OUTPUT_DIR, f"{tid}_{out_fn}") if out_fn else None
+                if alt and os.path.exists(alt):
+                    data["output_path"] = alt
 
 # Periodic cleanup of old temp files (every hour)
 def _cleanup_loop():

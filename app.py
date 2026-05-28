@@ -438,6 +438,7 @@ def _ensure_keepalive():
         if _keepalive_thread is None or not _keepalive_thread.is_alive():
             _keepalive_thread = threading.Thread(target=_keepalive_loop, daemon=True)
             _keepalive_thread.start()
+    _ocr_keepalive_ping()
 
 
 def _release_keepalive():
@@ -449,7 +450,7 @@ def _release_keepalive():
 
 
 def _keepalive_loop():
-    render_url = KEEPALIVE_URL
+    render_url = _get_render_url()
     local_url = f"http://localhost:{os.environ.get('PORT', 10000)}"
     while True:
         with _keepalive_lock:
@@ -458,14 +459,13 @@ def _keepalive_loop():
         success = False
         if render_url:
             try:
-                requests.get(f"{render_url}/health", timeout=15)
+                requests.get(f"{render_url}/health", timeout=10)
                 success = True
             except Exception:
                 pass
         if not success:
             try:
                 requests.get(f"{local_url}/health", timeout=5)
-                success = True
             except Exception:
                 pass
         time.sleep(60)
@@ -502,7 +502,17 @@ def calculate_eta(task):
         return f"{int(remaining//3600)}h {int((remaining%3600)//60)}m"
 
 
+def _get_render_url():
+    return KEEPALIVE_URL or os.environ.get("RENDER_EXTERNAL_URL", "")
+
 def _ocr_keepalive_ping():
+    url = _get_render_url()
+    if url:
+        try:
+            requests.get(f"{url}/health", timeout=10)
+            return
+        except Exception:
+            pass
     try:
         local = f"http://localhost:{os.environ.get('PORT', 10000)}"
         requests.get(f"{local}/health", timeout=5)

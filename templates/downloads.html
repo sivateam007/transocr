@@ -6,6 +6,7 @@
     <title>My Downloads - Siva OCR</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    {% if restoring %}<meta http-equiv="refresh" content="5">{% endif %}
 </head>
 <body>
     <header>
@@ -25,8 +26,19 @@
         <section class="content-section">
             <h2><i class="fas fa-download"></i> My Downloads</h2>
 
+            {% if restoring %}
+            <div style="text-align: center; padding: 2rem; margin-bottom: 1rem; border: 1px solid var(--git-color); border-radius: 8px; background: #f0fdf4;">
+                <i class="fas fa-cloud-download-alt" style="font-size: 2rem; color: var(--git-color);"></i>
+                <p style="font-size: 1.1rem; margin: 0.5rem 0; color: #333;">
+                    Restoring your files from cloud storage...
+                    <i class="fas fa-spinner fa-pulse" style="margin-left: 0.5rem;"></i>
+                </p>
+                <p style="font-size: 0.9rem; color: #666;">This page refreshes automatically once complete.</p>
+            </div>
+            {% endif %}
+
             {% if downloads %}
-            <div style="margin-top: 2rem; display: flex; gap: 0.5rem; flex-wrap: wrap;">
+            <div style="margin-top: 1rem; display: flex; gap: 0.5rem; flex-wrap: wrap;">
                 <button onclick="clearDownloads()" style="padding: 0.6rem 1.2rem; background: #dc2626; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600;"><i class="fas fa-trash-alt"></i> Clear All</button>
                 <button id="clear-selected-btn" onclick="clearSelected()" disabled style="padding: 0.6rem 1.2rem; background: #999; color: white; border: none; border-radius: 6px; cursor: not-allowed; font-weight: 600;"><i class="fas fa-check-double"></i> Clear Selected</button>
             </div>
@@ -138,7 +150,7 @@
                     </tbody>
                 </table>
             </div>
-            {% else %}
+            {% elif not restoring %}
             <div style="text-align: center; padding: 4rem 2rem; color: #666;">
                 <i class="fas fa-inbox" style="font-size: 4rem; margin-bottom: 1rem; color: #ddd;"></i>
                 <p style="font-size: 1.2rem;">No downloads yet.</p>

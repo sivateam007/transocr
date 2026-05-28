@@ -85,6 +85,7 @@ progress_tracker = {}  # task_id: { ... }
 
 # JSON file persistence for progress_tracker (survives Render restarts)
 PROGRESS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "progress_tracker.json")
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocr-outputs")
 _last_save_time = 0
 
 def _save_progress(force=False):
@@ -114,6 +115,65 @@ def _load_progress():
     except Exception as e:
         logger.error(f"Failed to load progress: {e}")
         return {}
+
+def persist_output(task_id):
+    """Copy completed output file from temp dir to persistent OUTPUT_DIR."""
+    with progress_lock:
+        task = progress_tracker.get(task_id)
+        if not task:
+            return False
+        src = task.get("output_path")
+        output_filename = task.get("output_filename")
+        if not src or not os.path.exists(src) or not output_filename:
+            return False
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    dest = os.path.join(OUTPUT_DIR, f"{task_id}_{output_filename}")
+    try:
+        shutil.copy2(src, dest)
+        with progress_lock:
+            task["output_path"] = dest
+        logger.info(f"Task {task_id}: Output persisted to {dest}")
+        return True
+    except Exception as e:
+        logger.error(f"Task {task_id}: Failed to persist output: {e}")
+        return False
+
+
+def rebuild_completed_from_local():
+    """Scan local OUTPUT_DIR and restore completed tasks not in progress_tracker."""
+    if not os.path.exists(OUTPUT_DIR):
+        return
+    now = time.time()
+    restored = 0
+    for fname in os.listdir(OUTPUT_DIR):
+        if not fname.endswith(".txt"):
+            continue
+        filepath = os.path.join(OUTPUT_DIR, fname)
+        if not os.path.isfile(filepath):
+            continue
+        # Filename format: {task_id}_{output_filename}
+        task_id = fname.split("_", 1)[0]
+        with progress_lock:
+            if task_id in progress_tracker:
+                continue
+        output_filename = fname[len(task_id) + 1:]
+        orig_name = output_filename.rsplit("_ocr.", 1)[0] if "_ocr." in output_filename else output_filename
+        with progress_lock:
+            progress_tracker[task_id] = {
+                "current_page": 0, "status": "completed",
+                "result_path": None, "error": None,
+                "filename": orig_name, "output_filename": output_filename,
+                "output_path": filepath,
+                "download_link": None,
+                "mega_uploaded": False, "mega_status": "",
+                "file_type": "pdf", "detected_language": "",
+                "pages_processed": 0, "percentage": 100,
+                "download_count": 0, "completed_at": now, "created_at": now
+            }
+            restored += 1
+    if restored:
+        logger.info(f"Restored {restored} completed tasks from local {OUTPUT_DIR}")
+
 
 def _get_memory_mb():
     """Get current RSS memory in MB (Linux only). Returns 0 on other platforms."""
@@ -994,6 +1054,9 @@ def process_file_background(task_id, file_path, filename, temp_dir, selected_lan
                 progress_tracker[task_id]["mega_uploaded"] = False
                 progress_tracker[task_id]["mega_status"] = f"failed: {error_msg}"
 
+        # Persist output file to ocr-outputs folder
+        persist_output(task_id)
+
         # Mark as completed (respect cancel flag)
         with progress_lock:
             if not progress_tracker[task_id].get("cancelled"):
@@ -1493,6 +1556,8 @@ def resume_ocr_processing(task_id, original_path, metadata, output_path, temp_di
                 progress_tracker[task_id]["mega_uploaded"] = False
                 progress_tracker[task_id]["mega_status"] = f"failed: {mega_err}"
 
+        persist_output(task_id)
+
         with progress_lock:
             progress_tracker[task_id]["status"] = "completed"
             progress_tracker[task_id]["pages_processed"] = pages_processed
@@ -1965,6 +2030,7 @@ def downloads_page():
 # Startup: scan Mega for incomplete tasks and resume them
 def _startup_resume():
     time.sleep(10)  # Wait for server to be ready
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     with app.app_context():
         # Load persisted progress from JSON file
         saved = _load_progress()
@@ -1974,10 +2040,19 @@ def _startup_resume():
                     # Preserve cancelled/error status; rest become interrupted
                     if data.get("status") not in ("completed", "error", "cancelled"):
                         data["status"] = "interrupted"
+                    # Fix output_path for completed tasks if local file exists
+                    if data.get("status") == "completed":
+                        op = data.get("output_path")
+                        if op and not os.path.exists(op):
+                            out_fn = data.get("output_filename")
+                            alt = os.path.join(OUTPUT_DIR, f"{tid}_{out_fn}") if out_fn else None
+                            if alt and os.path.exists(alt):
+                                data["output_path"] = alt
                     progress_tracker[tid] = data
             logger.info(f"Restored {len(saved)} persisted tasks from {PROGRESS_FILE}")
         scan_and_resume_checkpoints()
         rebuild_completed_from_mega()
+        rebuild_completed_from_local()
 
 threading.Thread(target=_startup_resume, daemon=True).start()
 

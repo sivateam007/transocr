@@ -507,9 +507,22 @@ header {
         padding: 2rem 1rem;
     }
 
+    .upload-tabs {
+        flex-wrap: wrap;
+        gap: 0.5rem;
+    }
+    .upload-tabs .tab-btn {
+        padding: 0.6rem 0.8rem !important;
+        font-size: 0.85rem !important;
+        flex: 1 1 calc(50% - 0.5rem);
+        min-width: 0;
+        text-align: center;
+    }
+
     .page-info {
         word-break: break-word;
         overflow-wrap: break-word;
+        max-width: 100%;
     }
 
     .file-name {

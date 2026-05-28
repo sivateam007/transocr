@@ -1,12 +1,35 @@
+# Python
 __pycache__/
-*.pyc
-*.pyo
-.env
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
 venv/
-*.pdf
-*.txt
-*.jpg
-*.png
-*.jpeg
-poppler-*/
+ENV/
+
+# Flask
+instance/
+.webassets-cache
+
+# Temp files
+tmp/
+temp/
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
 .DS_Store
+
+# Logs
+*.log
+
+# Local dev binaries (not needed for deployment)
+poppler/

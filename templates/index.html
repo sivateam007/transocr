@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Siva OCR - Professional OCR Service</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <!-- Header -->
+    <header>
+        <div class="header-container">
+            <div class="logo">
+                <h1>Siva OCR</h1>
+            </div>
+            <nav>
+                <a href="/downloads" style="color: white; text-decoration: none; font-weight: 600;">
+                    <i class="fas fa-download"></i> My Downloads
+                </a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <section class="content-section" id="upload">
+            <h2><i class="fas fa-cloud-upload-alt"></i> Upload</h2>
+
+            {% with messages = get_flashed_messages() %}
+                {% if messages %}
+                    <div class="flash-messages">
+                        {% for message in messages %}
+                            <div class="flash">{{ message }}</div>
+                        {% endfor %}
+                    </div>
+                {% endif %}
+            {% endwith %}
+
+            <!-- File Type Tabs -->
+            <div class="upload-tabs" style="display: flex; gap: 1rem; margin-bottom: 2rem; justify-content: center;">
+                <button type="button" class="tab-btn active" id="pdf-tab" style="padding: 1rem 2rem; border: 2px solid var(--git-color); background: var(--git-color); color: white; border-radius: 10px; cursor: pointer; font-weight: 600; font-family: 'Segoe UI', sans-serif; transition: all 0.3s;">
+                    <i class="fas fa-file-pdf"></i> PDF
+                </button>
+                <button type="button" class="tab-btn" id="image-tab" style="padding: 1rem 2rem; border: 2px solid #ddd; background: white; color: var(--dark); border-radius: 10px; cursor: pointer; font-weight: 600; font-family: 'Segoe UI', sans-serif; transition: all 0.3s;">
+                    <i class="fas fa-image"></i> Images
+                </button>
+                <button type="button" class="tab-btn" id="doc-tab" style="padding: 1rem 2rem; border: 2px solid #ddd; background: white; color: var(--dark); border-radius: 10px; cursor: pointer; font-weight: 600; font-family: 'Segoe UI', sans-serif; transition: all 0.3s;">
+                    <i class="fas fa-file-word"></i> Documents
+                </button>
+                <button type="button" class="tab-btn" id="data-tab" style="padding: 1rem 2rem; border: 2px solid #ddd; background: white; color: var(--dark); border-radius: 10px; cursor: pointer; font-weight: 600; font-family: 'Segoe UI', sans-serif; transition: all 0.3s;">
+                    <i class="fas fa-file-excel"></i> Data Files
+                </button>
+            </div>
+
+            <form method="POST" enctype="multipart/form-data" class="upload-form" id="upload-form">
+                <div class="file-input-wrapper">
+                    <input type="file" name="file" id="pdf-upload" accept=".pdf" required>
+                    <label for="pdf-upload" class="upload-box" id="drop-zone">
+                        <div class="upload-text">Click to upload or drag & drop</div>
+                        <div class="upload-hint">Supports: PDF</div>
+                        <div class="file-name" id="file-name"></div>
+                    </label>
+                </div>
+
+                <div class="options-grid">
+                    <div class="option-group">
+                        <label class="option-label">Language</label>
+                        <select name="language" id="language-select" class="select-input">
+                            <option value="auto">Auto-Detect</option>
+                            <option value="tam">Tamil</option>
+                            <option value="eng">English</option>
+                            <option value="hin">Hindi</option>
+                            <option value="tel">Telugu</option>
+                            <option value="ben">Bengali</option>
+                            <option value="kan">Kannada</option>
+                            <option value="mal">Malayalam</option>
+                            <option value="guj">Gujarati</option>
+                            <option value="pan">Punjabi</option>
+                            <option value="mar">Marathi</option>
+                            <option value="ara">Arabic</option>
+                            <option value="spa">Spanish</option>
+                            <option value="fra">French</option>
+                            <option value="deu">German</option>
+                            <option value="ita">Italian</option>
+                            <option value="rus">Russian</option>
+                            <option value="chi_sim">Chinese Simplified</option>
+                            <option value="jpn">Japanese</option>
+                            <option value="kor">Korean</option>
+                        </select>
+                    </div>
+
+                    <div class="option-group">
+                        <label class="option-label">Page Range</label>
+                        <select name="page_range" id="page-range-select" class="select-input">
+                            <option value="all">All Pages</option>
+                            <option value="custom">Custom Range</option>
+                        </select>
+                    </div>
+
+                    <div class="option-group" id="start-page-group" style="display: none;">
+                        <label class="option-label">Start Page</label>
+                        <input type="number" name="start_page" id="start-page" class="page-input" min="1" value="1" placeholder="From">
+                    </div>
+
+                    <div class="option-group" id="end-page-group" style="display: none;">
+                        <label class="option-label">End Page</label>
+                        <input type="number" name="end_page" id="end-page" class="page-input" min="1" placeholder="To (empty = all)">
+                    </div>
+                </div>
+
+                <button type="submit" class="submit-btn" id="submit-btn">
+                    <span id="btn-text">Extract Text</span>
+                </button>
+            </form>
+
+            <div class="info-box">
+                <h4><i class="fas fa-lightbulb"></i> Pro Tip:</h4>
+                <p>Select language manually to skip auto-detection delay. For PDF and Image files, OCR will be used. For other documents, text will be extracted directly.</p>
+            </div>
+
+            <p class="language-note">Supports: PDF, Images (JPG, PNG, BMP, TIFF), Documents (DOCX, PPTX, RTF, ODT), Data (XLSX, CSV, XML, JSON, HTML)</p>
+        </section>
+    </main>
+
+    <div class="loading-overlay" id="loading-overlay">
+        <div class="loading-spinner"></div>
+        <div class="loading-text" id="loading-text">Submitting for processing...</div>
+    </div>
+
+    <script>
+        const fileInput = document.getElementById('pdf-upload');
+        const fileName = document.getElementById('file-name');
+        const dropZone = document.getElementById('drop-zone');
+        const uploadForm = document.getElementById('upload-form');
+        const submitBtn = document.getElementById('submit-btn');
+        const btnText = document.getElementById('btn-text');
+        const loadingOverlay = document.getElementById('loading-overlay');
+        const loadingText = document.getElementById('loading-text');
+        const pageRangeSelect = document.getElementById('page-range-select');
+        const startPageGroup = document.getElementById('start-page-group');
+        const endPageGroup = document.getElementById('end-page-group');
+        
+        let currentTab = 'pdf';
+        const pdfTab = document.getElementById('pdf-tab');
+        const imageTab = document.getElementById('image-tab');
+        const docTab = document.getElementById('doc-tab');
+        const dataTab = document.getElementById('data-tab');
+
+        function switchTab(tab) {
+            // Reset all tabs
+            [pdfTab, imageTab, docTab, dataTab].forEach(t => {
+                t.style.background = 'white';
+                t.style.color = 'var(--dark)';
+                t.style.borderColor = '#ddd';
+                t.classList.remove('active');
+            });
+            
+            const uploadHint = document.querySelector('.upload-hint');
+            let accept = '';
+            let hint = '';
+            
+            if (tab === 'pdf') {
+                pdfTab.style.background = 'var(--git-color)';
+                pdfTab.style.color = 'white';
+                pdfTab.style.borderColor = 'var(--git-color)';
+                pdfTab.classList.add('active');
+                accept = '.pdf';
+                hint = 'Supports: PDF';
+                currentTab = 'pdf';
+                // Show page range options
+                document.querySelector('.options-grid').style.display = 'grid';
+            } else if (tab === 'image') {
+                imageTab.style.background = 'var(--git-color)';
+                imageTab.style.color = 'white';
+                imageTab.style.borderColor = 'var(--git-color)';
+                imageTab.classList.add('active');
+                accept = '.jpg,.jpeg,.png,.bmp,.tiff,.gif';
+                hint = 'Supports: JPG, PNG, BMP, TIFF, GIF';
+                currentTab = 'image';
+                // Hide page range options
+                document.querySelector('.options-grid').style.display = 'none';
+            } else if (tab === 'doc') {
+                docTab.style.background = 'var(--git-color)';
+                docTab.style.color = 'white';
+                docTab.style.borderColor = 'var(--git-color)';
+                docTab.classList.add('active');
+                accept = '.docx,.doc,.pptx,.ppt,.rtf,.odt,.ods,.odp,.html,.htm,.txt,.md';
+                hint = 'Supports: DOCX, DOC, PPTX, PPT, RTF, ODT, HTML, TXT';
+                currentTab = 'doc';
+                // Hide page range options
+                document.querySelector('.options-grid').style.display = 'none';
+            } else if (tab === 'data') {
+                dataTab.style.background = 'var(--git-color)';
+                dataTab.style.color = 'white';
+                dataTab.style.borderColor = 'var(--git-color)';
+                dataTab.classList.add('active');
+                accept = '.xlsx,.xls,.csv,.xml,.json';
+                hint = 'Supports: XLSX, XLS, CSV, XML, JSON';
+                currentTab = 'data';
+                // Hide page range options
+                document.querySelector('.options-grid').style.display = 'none';
+            }
+            
+            fileInput.accept = accept;
+            uploadHint.textContent = hint;
+        }
+
+        pdfTab.addEventListener('click', () => switchTab('pdf'));
+        imageTab.addEventListener('click', () => switchTab('image'));
+        docTab.addEventListener('click', () => switchTab('doc'));
+        dataTab.addEventListener('click', () => switchTab('data'));
+
+        fileInput.addEventListener('change', function() {
+            if (this.files.length > 0) {
+                fileName.textContent = this.files[0].name;
+            } else {
+                fileName.textContent = '';
+            }
+        });
+
+        // Drag and drop support
+        dropZone.addEventListener('dragover', function(e) {
+            e.preventDefault();
+            this.classList.add('drag-over');
+        });
+
+        dropZone.addEventListener('dragleave', function() {
+            this.classList.remove('drag-over');
+        });
+
+        dropZone.addEventListener('drop', function(e) {
+            e.preventDefault();
+            this.classList.remove('drag-over');
+
+            if (e.dataTransfer.files.length > 0) {
+                const file = e.dataTransfer.files[0];
+                const ext = file.name.split('.').pop().toLowerCase();
+                
+                let allowed = [];
+                if (currentTab === 'pdf') {
+                    allowed = ['pdf'];
+                } else if (currentTab === 'image') {
+                    allowed = ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'gif'];
+                } else if (currentTab === 'doc') {
+                    allowed = ['docx', 'doc', 'pptx', 'ppt', 'rtf', 'odt', 'ods', 'odp', 'html', 'htm', 'txt', 'md'];
+                } else if (currentTab === 'data') {
+                    allowed = ['xlsx', 'xls', 'csv', 'xml', 'json'];
+                }
+                
+                if (allowed.includes(ext)) {
+                    fileInput.files = e.dataTransfer.files;
+                    fileName.textContent = file.name;
+                } else {
+                    alert(`Please upload a ${currentTab === 'pdf' ? 'PDF' : currentTab === 'image' ? 'Image' : currentTab === 'doc' ? 'Document' : 'Data'} file`);
+                }
+            }
+        });
+
+        // Page range selection
+        pageRangeSelect.addEventListener('change', function() {
+            if (this.value === 'custom') {
+                startPageGroup.style.display = 'flex';
+                endPageGroup.style.display = 'flex';
+            } else {
+                startPageGroup.style.display = 'none';
+                endPageGroup.style.display = 'none';
+            }
+        });
+
+        // Show loading state on form submit
+        uploadForm.addEventListener('submit', function() {
+            submitBtn.disabled = true;
+            btnText.textContent = 'Processing...';
+            loadingText.textContent = 'Submitting for processing...';
+            loadingOverlay.classList.add('active');
+        });
+    </script>
+</body>
+</html>

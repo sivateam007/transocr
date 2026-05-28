@@ -1,213 +1,122 @@
-"""OCR Solutions — Background OCR with progress tracking, Mega cloud, keepalive, JSON persistence"""
+#!/usr/bin/env python3
+"""
+Offline PDF OCR Web App with Auto-Language Detection
+Flask application for rendering PDF OCR via web interface
+"""
 
 import os
-import re
-import json
 import tempfile
 import threading
-import time
-import gc
 import uuid
+import re
 import logging
+import time
 import shutil
-from io import BytesIO
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as _CTimeoutError
-
-from flask import Flask, flash, redirect, render_template_string, request, send_file, jsonify
+import json
+from flask import Flask, request, render_template, send_file, flash, redirect, url_for, jsonify
+from werkzeug.utils import secure_filename
 from pdf2image import convert_from_path, pdfinfo_from_path
-from PIL import Image
 import pytesseract
+from pytesseract import image_to_osd
+from PIL import Image
 import requests
-
-gc.set_threshold(100, 5, 2)
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
+import gc
+gc.set_threshold(100, 5, 2)  # More aggressive GC for memory-constrained environments
 import asyncio
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _CTimeoutError
 if not hasattr(asyncio, 'coroutine'):
     asyncio.coroutine = lambda f: f
-
-MEGA_AVAILABLE = False
-try:
-    from mega import Mega
-    MEGA_AVAILABLE = True
-except ImportError:
-    Mega = None
-
-try:
-    from docx import Document as DocxDocument
-except ImportError:
-    DocxDocument = None
-
-try:
-    from openpyxl import load_workbook
-except ImportError:
-    load_workbook = None
-
 try:
     from PyPDF2 import PdfReader
 except ImportError:
     PdfReader = None
 
-BATCH_SIZE = 1
-CHECKPOINT_INTERVAL = 5
-MEGA_LOGIN_TIMEOUT = 30
-CONVERT_TIMEOUT = 120
-OCR_TIMEOUT = 300
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", os.urandom(24).hex())
-app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 
-tasks = {}
-results = {}
-tasks_order = []
-tasks_lock = threading.Lock()
+# Jinja filter: Unix timestamp to readable date
+@app.template_filter('datetimeformat')
+def datetimeformat(timestamp):
+    import datetime
+    return datetime.datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M')
 
-MEGA_EMAIL = os.environ.get("MEGA_EMAIL", "")
-MEGA_PASSWORD = os.environ.get("MEGA_PASSWORD", "")
-KEEPALIVE_URL = os.environ.get("KEEPALIVE_URL", "")
+# Configuration
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
+app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE  # Reject oversized uploads early
+ALLOWED_EXTENSIONS = {
+    # PDF
+    'pdf',
+    # Images (OCR needed)
+    'jpg', 'jpeg', 'png', 'bmp', 'tiff', 'gif',
+    # Word documents
+    'docx', 'doc',
+    # PowerPoint
+    'pptx', 'ppt',
+    # Excel/Spreadsheets
+    'xlsx', 'xls', 'csv',
+    # Rich Text
+    'rtf',
+    # OpenDocument formats
+    'odt', 'ods', 'odp',
+    # HTML
+    'html', 'htm',
+    # XML/JSON
+    'xml', 'json',
+    # Plain text
+    'txt', 'md'
+}
+DEFAULT_LANG = 'tam'  # Tamil by default
+CHECKPOINT_INTERVAL = 5  # Upload checkpoint to Mega every N pages
+BATCH_SIZE = 1  # Pages per batch (lower = less memory per batch)
+MEGA_LOGIN_TIMEOUT = 30  # Seconds before Mega login times out
+CONVERT_TIMEOUT = 120  # Max seconds for convert_from_path per batch
+OCR_TIMEOUT = 300  # Max seconds per page for Tesseract OCR
 
-_active_tasks = 0
-_keepalive_lock = threading.Lock()
-_keepalive_thread = None
+# Progress tracking
+progress_lock = threading.Lock()
+progress_tracker = {}  # task_id: { ... }
 
-_mega_client = None
-_mega_lock = threading.Lock()
-
+# JSON file persistence for progress_tracker (survives Render restarts)
 PROGRESS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "progress_tracker.json")
 _last_save_time = 0
 
-IMG_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".gif"}
-TEXT_EXTS = {".txt", ".csv", ".tsv", ".md", ".json", ".xml"}
-OFFICE_EXTS = {".docx", ".xlsx"}
-SUPPORTED_EXTS = IMG_EXTS | {".pdf"} | TEXT_EXTS | OFFICE_EXTS
+def _save_progress(force=False):
+    """Save progress_tracker to JSON file with throttling (max 1 write/sec)."""
+    global _last_save_time
+    now = time.time()
+    if not force and now - _last_save_time < 2:
+        return
+    serializable = {}
+    with progress_lock:
+        for tid, task in progress_tracker.items():
+            serializable[tid] = dict(task)
+    try:
+        with open(PROGRESS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(serializable, f, default=str, ensure_ascii=False)
+        _last_save_time = now
+    except Exception as e:
+        logger.error(f"Failed to save progress: {e}")
 
-DOC_TYPES = {
-    "pdf": {"label": "PDF", "icon": "\U0001F4C4", "exts": [".pdf"]},
-    "image": {"label": "Images", "icon": "\U0001F5BC", "exts": list(IMG_EXTS)},
-    "word": {"label": "Word", "icon": "\U0001F4DD", "exts": [".docx"]},
-    "excel": {"label": "Excel", "icon": "\U0001F4CA", "exts": [".xlsx"]},
-    "data": {"label": "Data Files", "icon": "\U0001F4CB", "exts": list(TEXT_EXTS)},
-}
-
-LANG_OPTIONS = {
-    "auto": "Auto Detect",
-    "tam+eng": "Tamil + English",
-    "tam": "Tamil", "eng": "English", "hin": "Hindi",
-    "tel": "Telugu", "mal": "Malayalam", "kan": "Kannada",
-    "guj": "Gujarati", "ben": "Bengali", "mar": "Marathi",
-    "urd": "Urdu", "san": "Sanskrit",
-}
-
-HTML_HEADER = '''<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OCR Solutions - {{ title }}</title>
-<style>
-* { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-:root { --primary: #0c1f33; --secondary: #125683; --accent: #7f89d4; --light: #ecf0f1; --dark: #2c3e50; --success: #27ae60; --git-color: #e24124; }
-body { line-height: 1.6; color: #333; background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%); min-height: 100vh; }
-header { background: linear-gradient(135deg, var(--primary), var(--secondary)); color: white; padding: 0.8rem 0; position: sticky; top: 0; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
-.header-container { display: flex; justify-content: space-between; align-items: center; max-width: 1200px; margin: 0 auto; padding: 0 20px; }
-.logo h1 { font-size: 1.6rem; color: white; letter-spacing: 2px; }
-.logo span { color: var(--accent); font-weight: 300; letter-spacing: 1px; }
-.header-nav { display: flex; gap: 0.8rem; }
-.header-nav a { display: flex; align-items: center; gap: 6px; padding: 8px 18px; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 0.95rem; transition: all 0.3s; color: rgba(255,255,255,0.8); }
-.header-nav a:hover { background: rgba(255,255,255,0.15); color: white; }
-.header-nav a.active { background: var(--git-color); color: white; }
-.page-title { text-align: center; margin: 2.5rem 0 1.5rem; color: var(--dark); }
-.page-title:after { content: ''; display: block; width: 80px; height: 4px; background: var(--git-color); margin: 10px auto; border-radius: 2px; }
-.container { max-width: 900px; margin: 0 auto; padding: 0 20px; }
-.card { margin-bottom: 2rem; padding: 2rem; border-radius: 15px; background: white; box-shadow: 0 10px 30px rgba(0,0,0,0.1); }
-.card h2 { color: var(--dark); margin-bottom: 1.5rem; padding-bottom: 0.5rem; border-bottom: 2px solid var(--light); }
-.btn { display: inline-flex; align-items: center; gap: 6px; padding: 10px 24px; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; text-decoration: none; transition: all 0.3s; }
-.btn-primary { background: linear-gradient(135deg, var(--secondary), var(--accent)); color: white; }
-.btn-primary:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(18,86,131,0.4); }
-.btn-secondary { background: #6c757d; color: white; }
-.btn-secondary:hover { transform: translateY(-2px); }
-.btn-danger { background: var(--git-color); color: white; }
-.btn-danger:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(226,65,36,0.4); }
-.btn-sm { padding: 6px 14px; font-size: 0.85rem; }
-.doc-types { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 1.5rem; justify-content: center; }
-.doc-type-btn { flex: 1; min-width: 100px; padding: 12px 8px; border: 2px solid #dee2e6; border-radius: 10px; background: white; cursor: pointer; font-size: 0.85rem; font-weight: 600; transition: all 0.3s; text-align: center; }
-.doc-type-btn:hover { border-color: var(--accent); background: #f0f2ff; }
-.doc-type-btn.active { border-color: var(--git-color); background: #fff0ee; color: var(--git-color); }
-.file-upload-area { border: 2px dashed #ccc; border-radius: 12px; padding: 2.5rem; text-align: center; transition: all 0.3s; margin-bottom: 1.2rem; cursor: pointer; }
-.file-upload-area:hover { border-color: var(--accent); background: #f8f9ff; }
-.file-upload-area.has-file { border-color: var(--success); background: #f0fff4; }
-.file-upload-area .upload-icon { font-size: 3rem; margin-bottom: 0.5rem; }
-.file-upload-area p { color: #888; font-size: 0.95rem; }
-.file-name { margin-top: 0.5rem; font-weight: 600; color: var(--dark); word-break: break-all; }
-#file-input { display: none; }
-.form-row { display: flex; gap: 10px; margin-bottom: 1rem; flex-wrap: wrap; align-items: center; }
-.form-row select, .form-row input[type=number] { flex: 1; min-width: 120px; padding: 10px 14px; border: 2px solid #dee2e6; border-radius: 8px; font-size: 0.95rem; background: white; }
-.form-row select:focus, .form-row input:focus { outline: none; border-color: var(--accent); }
-.form-row label { display: flex; align-items: center; gap: 8px; font-weight: 600; color: var(--dark); cursor: pointer; }
-.form-row input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--secondary); }
-.upload-btn { width: 100%; padding: 14px; background: linear-gradient(135deg, var(--secondary), var(--accent)); color: white; border: none; border-radius: 10px; font-size: 1.1rem; font-weight: 600; cursor: pointer; transition: all 0.3s; }
-.upload-btn:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(18,86,131,0.4); }
-.formats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px,1fr)); gap: 10px; }
-.format-card { padding: 12px; background: var(--light); border-radius: 8px; text-align: center; font-weight: 600; color: var(--dark); font-size: 0.9rem; }
-.tip-box { background: #fff8e1; border-left: 4px solid #ffc107; padding: 1rem 1.5rem; border-radius: 8px; }
-.tip-icon { font-size: 1.2rem; }
-.progress-page .task-id { font-size: 0.8rem; color: #999; margin-bottom: 5px; word-break: break-all; }
-.progress-filename { font-size: 1.2rem; font-weight: 700; color: var(--dark); margin-bottom: 1.5rem; word-break: break-all; }
-.progress-status { display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: 12px; margin-bottom: 1.5rem; }
-.progress-stat { text-align: center; padding: 10px; background: var(--light); border-radius: 10px; }
-.progress-stat .value { font-size: 1.3rem; font-weight: 700; color: var(--dark); }
-.progress-stat .label { font-size: 0.75rem; color: #888; margin-top: 4px; text-transform: uppercase; letter-spacing: 1px; }
-.progress-bar-bg { height: 14px; background: #e9ecef; border-radius: 10px; overflow: hidden; margin: 1rem 0; }
-.progress-bar-fill { height: 100%; background: linear-gradient(90deg, var(--secondary), var(--accent)); border-radius: 10px; transition: width 1s ease; }
-.progress-actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-top: 1.5rem; }
-.status-badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; }
-.status-badge.processing { background: #fff3cd; color: #856404; }
-.status-badge.completed { background: #d4edda; color: #155724; }
-.status-badge.failed { background: #f8d7da; color: #721c24; }
-.status-badge.interrupted { background: #e2e3e5; color: #383d41; }
-.section-title { margin: 1.5rem 0 1rem; padding-bottom: 8px; border-bottom: 2px solid var(--light); color: var(--dark); }
-.download-table { width: 100%; border-collapse: collapse; margin-bottom: 1rem; }
-.download-table th { background: var(--light); color: var(--dark); padding: 10px 12px; text-align: left; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1px; white-space: nowrap; }
-.download-table td { padding: 10px 12px; border-bottom: 1px solid #eee; font-size: 0.9rem; word-break: break-all; }
-.download-table tr:hover { background: #f8f9fa; }
-.download-table .actions { white-space: nowrap; }
-.flash-msg { padding: 12px 20px; margin-bottom: 1rem; border-radius: 8px; font-weight: 600; }
-.flash-msg.error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-.flash-msg.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-/* Preview modal */
-.modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center; }
-.modal-overlay.active { display: flex; }
-.modal-content { background: white; border-radius: 12px; max-width: 700px; width: 90%; max-height: 80vh; overflow-y: auto; padding: 2rem; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
-.modal-content h3 { margin-bottom: 1rem; }
-.modal-content pre { background: #f5f5f5; padding: 1rem; border-radius: 8px; font-size: 0.85rem; white-space: pre-wrap; word-break: break-word; max-height: 50vh; overflow-y: auto; }
-.modal-close { float: right; background: none; border: none; font-size: 1.5rem; cursor: pointer; color: #999; }
-.modal-close:hover { color: #333; }
-@media (max-width:600px) { .header-container { flex-direction: column; gap: 8px; } .doc-type-btn { min-width: 70px; font-size: 0.75rem; padding: 10px 4px; } .form-row { flex-direction: column; } .progress-status { grid-template-columns: repeat(3, 1fr); } }
-</style>
-</head>
-<body>
-<header>
-<div class="header-container">
-<div class="logo"><h1>OCR <span>Solutions</span></h1></div>
-<nav class="header-nav">
-<a href="/" class="{{ 'active' if active == 'upload' else '' }}">\U0001F4C1 Upload</a>
-<a href="/downloads" class="{{ 'active' if active == 'downloads' else '' }}">\U0001F4E6 My Downloads</a>
-</nav>
-</div>
-</header>
-{% for f in flashes %}
-<div class="flash-msg {{ f[1] }}">{{ f[0] }}</div>
-{% endfor %}
-'''
-
-HTML_CLOSING = '\n</body>\n</html>\n'
-
+def _load_progress():
+    """Load progress_tracker from JSON file on startup."""
+    if not os.path.exists(PROGRESS_FILE):
+        return {}
+    try:
+        with open(PROGRESS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Failed to load progress: {e}")
+        return {}
 
 def _get_memory_mb():
+    """Get current RSS memory in MB (Linux only). Returns 0 on other platforms."""
     try:
         if os.name == 'posix':
             with open('/proc/self/status') as f:
@@ -218,54 +127,1038 @@ def _get_memory_mb():
         pass
     return 0
 
+# Self-keepalive to prevent Render from sleeping during background tasks
+_active_tasks = 0
+_keepalive_lock = threading.Lock()
+_keepalive_thread = None
 
-def _save_progress(force=False):
-    global _last_save_time
-    now = time.time()
-    if not force and now - _last_save_time < 2:
-        return
-    serializable = {}
-    with tasks_lock:
-        for tid, task in tasks.items():
-            d = dict(task)
-            d.pop('filepath', None)
-            serializable[tid] = d
+# Secondary keepalive: each active OCR thread also pings itself
+_ocr_keepalive_running = threading.Event()
+
+# Language detection mapping
+SCRIPT_TO_LANG = {
+    "Tamil": "tam",
+    "Latin": "eng",  # Default Latin script to English
+    "Devanagari": "hin",  # Hindi (most common Devanagari)
+    "Telugu": "tel",
+    "Bengali": "ben",
+    "Kannada": "kan",
+    "Malayalam": "mal",
+    "Gujarati": "guj",
+    "Punjabi": "pan",
+    "Marathi": "mar",
+    "Arabic": "ara",
+    "Cyrillic": "rus",  # Russian
+    "Greek": "ell",
+    "Hebrew": "heb",
+    "Thai": "tha",
+    "Chinese": "chi_sim",  # Simplified Chinese
+    "Japanese": "jpn",
+    "Korean": "kor",
+    "Spanish": "spa",
+    "French": "fra",
+    "German": "deu",
+    "Italian": "ita",
+    # Add more as needed
+}
+
+# Language code to full name mapping
+LANG_CODE_TO_NAME = {
+    "tam": "Tamil",
+    "eng": "English",
+    "hin": "Hindi",
+    "tel": "Telugu",
+    "ben": "Bengali",
+    "kan": "Kannada",
+    "mal": "Malayalam",
+    "guj": "Gujarati",
+    "pan": "Punjabi",
+    "mar": "Marathi",
+    "ara": "Arabic",
+    "rus": "Russian",
+    "ell": "Greek",
+    "heb": "Hebrew",
+    "tha": "Thai",
+    "chi_sim": "Chinese (Simplified)",
+    "jpn": "Japanese",
+    "kor": "Korean",
+    "spa": "Spanish",
+    "fra": "French",
+    "deu": "German",
+    "ita": "Italian",
+}
+
+def get_file_type(filename):
+    """Determine file type and processing method"""
+    ext = filename.rsplit('.', 1)[1].lower()
+    if ext == 'pdf':
+        return 'pdf'
+    elif ext in ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'gif']:
+        return 'image'
+    elif ext in ['docx', 'doc']:
+        return 'docx'
+    elif ext in ['pptx', 'ppt']:
+        return 'pptx'
+    elif ext in ['xlsx', 'xls', 'csv']:
+        return 'spreadsheet'
+    elif ext == 'rtf':
+        return 'rtf'
+    elif ext in ['odt', 'ods', 'odp']:
+        return 'opendocument'
+    elif ext in ['html', 'htm']:
+        return 'html'
+    elif ext in ['xml', 'json']:
+        return 'data'
+    elif ext in ['txt', 'md']:
+        return 'text'
+    return None
+
+def allowed_file(filename):
+    """Check if file has allowed extension"""
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def get_page_count(pdf_path):
+    """
+    Get total page count using multiple methods (pdfinfo_from_path, then PyPDF2 fallback)
+    """
+    # Method 1: pdfinfo_from_path (fast, from poppler)
     try:
-        with open(PROGRESS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(serializable, f, default=str, ensure_ascii=False)
-        _last_save_time = now
+        pdf_info = pdfinfo_from_path(pdf_path)
+        total_pages = pdf_info.get("Pages", pdf_info.get("pages"))
+        logger.info(f"Page count from pdfinfo: {total_pages}")
+        return total_pages
     except Exception as e:
-        logger.error(f"Save progress failed: {e}")
+        logger.warning(f"pdfinfo failed: {e}, trying PyPDF2")
 
-
-def _load_progress():
-    if not os.path.exists(PROGRESS_FILE):
-        return {}
-    try:
-        with open(PROGRESS_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as e:
-        logger.error(f"Load progress failed: {e}")
-        return {}
-
-
-def get_mega():
-    global _mega_client
-    if not MEGA_AVAILABLE or not MEGA_EMAIL or not MEGA_PASSWORD:
-        return None
-    if _mega_client is not None:
-        return _mega_client
-    with _mega_lock:
-        if _mega_client is not None:
-            return _mega_client
+    # Method 2: PyPDF2 (more reliable fallback)
+    if PdfReader:
         try:
-            _mega_client = Mega().login(MEGA_EMAIL, MEGA_PASSWORD)
+            reader = PdfReader(pdf_path)
+            total_pages = len(reader.pages)
+            logger.info(f"Page count from PyPDF2: {total_pages}")
+            return total_pages
+        except Exception as e:
+            logger.error(f"PyPDF2 failed: {e}")
+
+    logger.warning("Could not determine total page count")
+    return None  # Unknown
+
+def detect_pdf_language(pdf_path, sample_page=1):
+    """
+    Detect the primary language of a PDF by sampling the first page.
+    Returns Tesseract language code (e.g., 'tam', 'eng').
+    Uses OSD for non-Tamil scripts, verifies with character检查 for Tamil.
+    """
+    try:
+        images = convert_from_path(
+            pdf_path,
+            dpi=150,
+            first_page=sample_page,
+            last_page=sample_page
+        )
+        if not images:
+            logger.warning("No image from first page, defaulting to Tamil")
+            return DEFAULT_LANG
+
+        # Step 1: OSD (fast, good for non-Tamil scripts)
+        osd_result = image_to_osd(images[0])
+        logger.info(f"OSD result: {osd_result[:200]}...")
+
+        script_match = re.search(r"Script: ([^\n]+)", osd_result)
+        if script_match:
+            script_name = script_match.group(1).strip()
+            # If OSD says Tamil (or any non-Latin script), trust it
+            if script_name != "Latin":
+                lang_code = SCRIPT_TO_LANG.get(script_name, DEFAULT_LANG)
+                logger.info(f"OSD detected: {script_name} → Language: {lang_code}")
+                return lang_code
+
+        # Step 2: OSD said Latin or failed — verify with quick Tamil OCR
+        # Many Tamil PDFs are misdetected as Latin by OSD
+        try:
+            tam_text = pytesseract.image_to_string(images[0], lang='tam')
+            tamil_chars = len(re.findall(r'[\u0B80-\u0BFF]', tam_text))
+            logger.info(f"Tamil verification: {tamil_chars} Tamil chars found")
+            if tamil_chars > 5:
+                logger.info("Confirmed Tamil via character detection")
+                return 'tam'
         except Exception:
-            _mega_client = None
-    return _mega_client
+            pass
+
+        if script_match:
+            script_name = script_match.group(1).strip()
+            lang_code = SCRIPT_TO_LANG.get(script_name, DEFAULT_LANG)
+            logger.info(f"No Tamil chars found, using OSD: {script_name} → {lang_code}")
+            return lang_code
+
+    except Exception as e:
+        logger.warning(f"Language detection failed: {e}, defaulting to Tamil")
+    return DEFAULT_LANG
+
+
+def _ocr_page(img, lang, timeout, task_id, page):
+    """Run OCR on a single image with timeout. Uses a fresh thread pool per call."""
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        f = pool.submit(pytesseract.image_to_string, img, lang)
+        result = f.result(timeout=timeout)
+        return result
+    except Exception as e:
+        logger.warning(f"Task {task_id}: OCR failed on page {page} ({timeout}s timeout): {e}")
+        raise
+    finally:
+        pool.shutdown(wait=False)
+
+
+def process_pdf_ocr(pdf_path, lang=DEFAULT_LANG, dpi=200, task_id=None, output_file=None, start_page=None, end_page=None):
+    """
+    Process PDF pages in batches using OCR, write directly to file for memory efficiency.
+    Updates progress_tracker if task_id is provided.
+    Processes pages from start_page to end_page (inclusive) in batches of BATCH_SIZE.
+    If end_page is None, processes only start_page (single page mode).
+    Returns number of pages processed.
+    """
+    page_num = start_page if start_page else 1
+    actual_end = end_page if end_page else page_num
+    pages_processed = 0
+    batch_size = BATCH_SIZE
+
+    current = page_num
+    while current <= actual_end:
+        # Pre-batch GC and memory check
+        gc.collect()
+        mem = _get_memory_mb()
+        if mem > 400:
+            logger.warning(f"Task {task_id}: RSS {mem}MB > 400MB before page {current}, forcing aggressive GC")
+            gc.collect()
+            gc.collect()
+        
+        # Check cancel
+        if task_id:
+            with progress_lock:
+                if progress_tracker[task_id].get("cancelled"):
+                    logger.info(f"Task {task_id}: OCR cancelled")
+                    return pages_processed
+        batch_end = min(current + batch_size - 1, actual_end)
+
+        if task_id:
+            with progress_lock:
+                progress_tracker[task_id]["current_page"] = current
+
+        convert_pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            convert_future = convert_pool.submit(
+                convert_from_path, pdf_path, dpi=dpi,
+                first_page=current, last_page=batch_end
+            )
+            images = convert_future.result(timeout=CONVERT_TIMEOUT)
+        except _CTimeoutError:
+            logger.warning(f"Task {task_id}: Batch convert timed out pages {current}-{batch_end}, trying single-page fallback")
+            images = None
+        except Exception as e:
+            logger.warning(f"Task {task_id}: Batch convert failed pages {current}-{batch_end}: {e}, trying single-page fallback")
+            images = None
+        finally:
+            convert_pool.shutdown(wait=False)
+
+        # If batch convert failed, process pages one at a time
+        if images is None:
+            single_page = current
+            while single_page <= batch_end:
+                # Check cancel
+                if task_id:
+                    with progress_lock:
+                        if progress_tracker[task_id].get("cancelled"):
+                            logger.info(f"Task {task_id}: OCR cancelled during fallback")
+                            return pages_processed
+                convert_pool2 = ThreadPoolExecutor(max_workers=1)
+                try:
+                    sf = convert_pool2.submit(
+                        convert_from_path, pdf_path, dpi=dpi,
+                        first_page=single_page, last_page=single_page
+                    )
+                    single_images = sf.result(timeout=CONVERT_TIMEOUT)
+                except Exception:
+                    logger.warning(f"Task {task_id}: Skipping page {single_page} (convert failed/timed out)")
+                    single_page += 1
+                    continue
+                finally:
+                    convert_pool2.shutdown(wait=False)
+
+                if single_images:
+                    page = single_page
+                    t0 = time.time()
+                    try:
+                        text = _ocr_page(single_images[0], lang, OCR_TIMEOUT, task_id, page)
+                        elapsed = time.time() - t0
+                        if task_id:
+                            with progress_lock:
+                                times = progress_tracker[task_id].setdefault("page_times", [])
+                                times.append(elapsed)
+                                if len(times) > 5:
+                                    times.pop(0)
+                    except Exception:
+                        text = f"[OCR failed on page {page}]"
+                    single_images[0].close()
+                    if output_file:
+                        output_file.write(f"--- Page {page} ---\n{text}\n\n")
+                        output_file.flush()
+                    pages_processed += 1
+                    if task_id:
+                        with progress_lock:
+                            progress_tracker[task_id]["current_page"] = page
+                            total = progress_tracker[task_id].get("total_pages")
+                            start_offset = progress_tracker[task_id].get("processing_start_page", 1)
+                            if total:
+                                relative_page = max(0, page - start_offset + 1)
+                                pct = max(1, min(int((relative_page / total) * 100), 99))
+                                progress_tracker[task_id]["percentage"] = pct
+                    # Explicitly clean up single_images list
+                    for sim in single_images:
+                        try:
+                            sim.close()
+                        except Exception:
+                            pass
+                    single_images.clear()
+                gc.collect()
+                single_page += 1
+            current = batch_end + 1
+            gc.collect()
+            continue
+
+        if not images:
+            break
+
+        # OCR each page with timeout
+        for i, img in enumerate(images):
+            # Check cancel
+            if task_id:
+                with progress_lock:
+                    if progress_tracker[task_id].get("cancelled"):
+                        logger.info(f"Task {task_id}: OCR cancelled mid-batch")
+                        img.close()
+                        return pages_processed
+            page = current + i
+            t0 = time.time()
+            try:
+                text = _ocr_page(img, lang, OCR_TIMEOUT, task_id, page)
+                elapsed = time.time() - t0
+                if task_id:
+                    with progress_lock:
+                        times = progress_tracker[task_id].setdefault("page_times", [])
+                        times.append(elapsed)
+                        if len(times) > 5:
+                            times.pop(0)
+            except Exception:
+                text = f"[OCR failed on page {page}]"
+            img.close()
+            if output_file:
+                output_file.write(f"--- Page {page} ---\n{text}\n\n")
+                output_file.flush()
+            pages_processed += 1
+            if task_id:
+                    with progress_lock:
+                        progress_tracker[task_id]["current_page"] = page
+                        total = progress_tracker[task_id].get("total_pages")
+                        start_offset = progress_tracker[task_id].get("processing_start_page", 1)
+                        if total:
+                            relative_page = max(0, page - start_offset + 1)
+                            pct = max(1, min(int((relative_page / total) * 100), 99))
+                            progress_tracker[task_id]["percentage"] = pct
+
+        # Aggressive cleanup: close all remaining image handles
+        for im in images:
+            try:
+                im.close()
+            except Exception:
+                pass
+        del images
+        gc.collect()
+        # Log memory every 20 pages
+        if pages_processed > 0 and pages_processed % 20 == 0:
+            mem = _get_memory_mb()
+            if mem:
+                logger.info(f"Task {task_id}: Processed {pages_processed} pages, RSS ~{mem}MB")
+        current = batch_end + 1
+
+    return pages_processed
+
+def process_image_file(image_path, lang='eng'):
+    """Process image file with OCR"""
+    try:
+        img = Image.open(image_path)
+        # Convert to RGB if necessary
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        text = pytesseract.image_to_string(img, lang=lang)
+        return text
+    except Exception as e:
+        logger.error(f"Image processing error: {e}")
+        raise
+
+def process_docx_file(docx_path):
+    """Extract text from DOCX file (no OCR needed)"""
+    try:
+        from docx import Document
+        doc = Document(docx_path)
+        full_text = []
+        for para in doc.paragraphs:
+            if para.text.strip():
+                full_text.append(para.text)
+        return '\n'.join(full_text)
+    except Exception as e:
+        logger.error(f"DOCX processing error: {e}")
+        raise
+
+def process_pptx_file(pptx_path):
+    """Extract text from PPTX file (no OCR needed)"""
+    try:
+        from pptx import Presentation
+        prs = Presentation(pptx_path)
+        full_text = []
+        for i, slide in enumerate(prs.slides, 1):
+            full_text.append(f"--- Slide {i} ---")
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text.strip():
+                    full_text.append(shape.text.strip())
+        return '\n'.join(full_text)
+    except Exception as e:
+        logger.error(f"PPTX processing error: {e}")
+        raise
+
+def process_txt_file(txt_path):
+    """Read text file directly"""
+    try:
+        with open(txt_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except UnicodeDecodeError:
+        # Try with different encoding
+        with open(txt_path, 'r', encoding='latin-1') as f:
+            return f.read()
+
+def process_spreadsheet_file(file_path, ext):
+    """Extract text from Excel/CSV files"""
+    try:
+        import pandas as pd
+        full_text = []
+        
+        if ext in ['xlsx', 'xls']:
+            # Read all sheets
+            xl_file = pd.ExcelFile(file_path)
+            for sheet_name in xl_file.sheet_names:
+                full_text.append(f"--- Sheet: {sheet_name} ---")
+                df = pd.read_excel(file_path, sheet_name=sheet_name)
+                full_text.append(df.to_string(index=False))
+        elif ext == 'csv':
+            df = pd.read_csv(file_path)
+            full_text.append(df.to_string(index=False))
+        
+        return '\n'.join(full_text)
+    except Exception as e:
+        logger.error(f"Spreadsheet processing error: {e}")
+        raise
+
+def process_rtf_file(rtf_path):
+    """Extract text from RTF files"""
+    try:
+        from pyth import open as pyth_open
+        doc = pyth_open(rtf_path)
+        return doc.get_text()
+    except Exception as e:
+        logger.error(f"RTF processing error: {e}")
+        raise
+
+def process_opendocument_file(odt_path, ext):
+    """Extract text from OpenDocument files"""
+    try:
+        from odfpy import opendocument
+        from xml.etree import ElementTree as ET
+        
+        doc = opendocument.load(odt_path)
+        
+        # Extract text from paragraphs
+        full_text = []
+        for para in doc.getElementsByType(odfpy.text.P):
+            text = para.getFirstChildText()
+            if text and text.strip():
+                full_text.append(text.strip())
+        
+        return '\n'.join(full_text)
+    except Exception as e:
+        logger.error(f"OpenDocument processing error: {e}")
+        raise
+
+def process_html_file(html_path):
+    """Extract text from HTML files"""
+    try:
+        from bs4 import BeautifulSoup
+        with open(html_path, 'r', encoding='utf-8') as f:
+            soup = BeautifulSoup(f, 'html.parser')
+            # Remove script and style elements
+            for script in soup(["script", "style"]):
+                script.decompose()
+            return soup.get_text(separator='\n', strip=True)
+    except Exception as e:
+        logger.error(f"HTML processing error: {e}")
+        raise
+
+def process_data_file(data_path, ext):
+    """Extract text from XML/JSON files"""
+    try:
+        with open(data_path, 'r', encoding='utf-8') as f:
+            if ext == 'json':
+                import json
+                data = json.load(f)
+                return json.dumps(data, indent=2)
+            else:  # XML
+                from xml.etree import ElementTree as ET
+                tree = ET.parse(f)
+                root = tree.getroot()
+                return ET.tostring(root, encoding='unicode', method='text')
+    except Exception as e:
+        logger.error(f"Data file processing error: {e}")
+        raise
+
+def process_file_background(task_id, file_path, filename, temp_dir, selected_lang='auto', start_page=1, end_page=None, dpi=200, file_type='pdf'):
+    """
+    Background thread function to process any file type and update progress
+    """
+    try:
+        # Initialize progress
+        with progress_lock:
+            progress_tracker[task_id]["status"] = "processing"
+            progress_tracker[task_id]["total_pages"] = 1  # Single unit for non-PDF
+        
+        # Create output file path
+        output_filename = f"{os.path.splitext(filename)[0]}_ocr.txt"
+        output_path = os.path.join(temp_dir, output_filename)
+        
+        with progress_lock:
+            progress_tracker[task_id]["output_path"] = output_path
+            progress_tracker[task_id]["output_filename"] = output_filename
+        
+        # Process based on file type
+        if file_type == 'pdf':
+            # Existing PDF processing logic
+            # Determine language
+            if selected_lang != 'auto':
+                # Manual selection
+                detected_lang = selected_lang
+                logger.info(f"Task {task_id}: Using manually selected language {detected_lang}")
+                with progress_lock:
+                    progress_tracker[task_id]["status"] = "getting_page_count"
+                    progress_tracker[task_id]["detected_language"] = detected_lang
+            else:
+                # Auto-detect
+                with progress_lock:
+                    progress_tracker[task_id]["status"] = "detecting_language"
+                
+                detected_lang = detect_pdf_language(file_path)
+                logger.info(f"Task {task_id}: Detected language {detected_lang}")
+                
+                with progress_lock:
+                    progress_tracker[task_id]["status"] = "getting_page_count"
+                    progress_tracker[task_id]["detected_language"] = detected_lang
+            
+            logger.info(f"Task {task_id}: Starting page count for {file_path}")
+            
+            # Get total page count
+            total_pages = get_page_count(file_path)
+            logger.info(f"Task {task_id}: Total pages = {total_pages}")
+            
+            # Adjust page range
+            actual_start = start_page
+            actual_end = end_page
+            
+            if actual_end is None or actual_end > total_pages:
+                actual_end = total_pages
+            
+            if actual_start > total_pages:
+                actual_start = 1
+            
+            logger.info(f"Task {task_id}: Processing pages {actual_start} to {actual_end}")
+            
+            with progress_lock:
+                progress_tracker[task_id]["status"] = "processing"
+                page_range = actual_end - actual_start + 1 if actual_end else total_pages - actual_start + 1
+                progress_tracker[task_id]["total_pages"] = page_range
+                progress_tracker[task_id]["pdf_total_pages"] = total_pages
+                progress_tracker[task_id]["processing_start_page"] = actual_start
+            
+            # Process PDF and write directly to file (memory efficient)
+            logger.info(f"Task {task_id}: Starting OCR processing with language {detected_lang}")
+            
+            mega_ckpt = None
+            originals_uploaded = False
+            
+            # Track start time
+            ocr_start_time = time.time()
+            pages_processed = 0
+            last_checkpoint_pages = 0
+            
+            with open(output_path, 'w', encoding='utf-8') as output_file:
+                current = actual_start
+                while actual_end is None or current <= actual_end:
+                    if total_pages and current > total_pages:
+                        break
+                    
+                    # Check for cancel
+                    cancelled_flag = False
+                    if task_id:
+                        with progress_lock:
+                            if progress_tracker[task_id].get("cancelled"):
+                                logger.info(f"Task {task_id}: Cancelled by user")
+                                progress_tracker[task_id]["status"] = "cancelled"
+                                progress_tracker[task_id]["error"] = "Cancelled by user"
+                                cancelled_flag = True
+                    if cancelled_flag:
+                        _save_progress()
+                        return
+                    
+                    batch_end = min(current + BATCH_SIZE - 1, actual_end) if actual_end else current + BATCH_SIZE - 1
+                    
+                    # Process batch of pages
+                    result = process_pdf_ocr(
+                        file_path,
+                        lang=detected_lang,
+                        dpi=dpi,
+                        task_id=task_id,
+                        output_file=output_file,
+                        start_page=current,
+                        end_page=batch_end
+                    )
+                    if result == 0:
+                        break
+                    
+                    pages_processed += result
+                    current = batch_end + 1
+                    
+                    # Log page progress every 10 pages
+                    if pages_processed % 10 == 0:
+                        logger.info(f"Task {task_id}: Processed {pages_processed} pages so far")
+                        _ocr_keepalive_ping()
+                    
+                    # Save progress every page for crash recovery (throttled to max 1 write/2s)
+                    _save_progress()
+                    
+                    # Upload checkpoint to Mega every CHECKPOINT_INTERVAL pages
+                    if pages_processed - last_checkpoint_pages >= CHECKPOINT_INTERVAL:
+                        last_checkpoint_pages = pages_processed
+                        # Lazy Mega login (only when first checkpoint is due)
+                        if mega_ckpt is None and os.environ.get("MEGA_EMAIL") and os.environ.get("MEGA_PWD"):
+                            mega_ckpt = init_mega()
+
+                        if mega_ckpt:
+                            # Upload original file on first checkpoint only (best-effort)
+                            if not originals_uploaded:
+                                try:
+                                    originals_handle = ensure_mega_folder(mega_ckpt, "ocr-originals")
+                                    if originals_handle:
+                                        result = mega_call(mega_ckpt, "upload", file_path, dest=originals_handle, dest_filename=filename, timeout=120)
+                                        with progress_lock:
+                                            progress_tracker[task_id]["mega_original_handle"] = str(getattr(result, 'node_id', result))
+                                        originals_uploaded = True
+                                        logger.info(f"Task {task_id}: Original uploaded to Mega for resume")
+                                except Exception as e:
+                                    logger.warning(f"Task {task_id}: Original upload failed (checkpoint still saved): {e}")
+
+                            checkpoint_data = {
+                                "task_id": task_id,
+                                "last_page": current - 1,
+                                "total_pages": total_pages,
+                                "filename": filename,
+                                "output_filename": output_filename,
+                                "detected_lang": detected_lang,
+                                "file_type": "pdf",
+                                "start_page": actual_start,
+                                "end_page": actual_end,
+                                "created_at": time.time(),
+                                "original_filename": filename
+                            }
+                            try:
+                                upload_checkpoint(mega_ckpt, task_id, output_path, checkpoint_data)
+                                logger.info(f"Task {task_id}: Checkpoint saved at page {current - 1}")
+                                with progress_lock:
+                                    progress_tracker[task_id]["last_checkpoint_page"] = current - 1
+                                _save_progress()
+                            except Exception as e:
+                                logger.warning(f"Task {task_id}: Checkpoint upload failed: {e}")
+            
+            logger.info(f"Task {task_id}: OCR returned {pages_processed} pages")
+            
+            # Check if cancelled before treating empty output as error
+            if pages_processed == 0:
+                cancelled_here = False
+                with progress_lock:
+                    if progress_tracker[task_id].get("cancelled"):
+                        logger.info(f"Task {task_id}: Cancelled by user")
+                        progress_tracker[task_id]["status"] = "cancelled"
+                        progress_tracker[task_id]["error"] = "Cancelled by user"
+                        cancelled_here = True
+                if cancelled_here:
+                    _save_progress()
+                    return
+
+            # Verify output file has content
+            if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+                logger.error(f"Task {task_id}: Output file empty or missing")
+                with progress_lock:
+                    progress_tracker[task_id]["status"] = "error"
+                    progress_tracker[task_id]["error"] = "No text could be extracted"
+                _save_progress()
+                return
+            
+            # Update tracker with success (check cancel race)
+            with progress_lock:
+                if progress_tracker[task_id].get("cancelled"):
+                    progress_tracker[task_id]["status"] = "cancelled"
+                    progress_tracker[task_id]["error"] = "Cancelled by user"
+                else:
+                    progress_tracker[task_id]["status"] = "completed"
+                    progress_tracker[task_id]["pages_processed"] = pages_processed
+                    progress_tracker[task_id]["percentage"] = 100
+            _save_progress()
+            logger.info(f"Task {task_id}: OCR completed successfully")
+            
+        elif file_type == 'image':
+            # Update language detection for images
+            if selected_lang == 'auto':
+                with progress_lock:
+                    progress_tracker[task_id]["detected_language"] = 'eng'  # Default for images
+            
+            with progress_lock:
+                progress_tracker[task_id]["current_page"] = 1
+                progress_tracker[task_id]["percentage"] = 50
+            
+            # Process image with OCR
+            text = process_image_file(file_path, lang=selected_lang if selected_lang != 'auto' else 'eng')
+            
+            # Write to output
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(text)
+            
+            with progress_lock:
+                progress_tracker[task_id]["percentage"] = 100
+                progress_tracker[task_id]["pages_processed"] = 1
+                
+        elif file_type == 'docx':
+            # Extract text directly (no OCR)
+            with progress_lock:
+                progress_tracker[task_id]["current_page"] = 1
+                progress_tracker[task_id]["percentage"] = 50
+            
+            text = process_docx_file(file_path)
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(text)
+            
+            with progress_lock:
+                progress_tracker[task_id]["percentage"] = 100
+                progress_tracker[task_id]["pages_processed"] = 1
+                
+        elif file_type == 'pptx':
+            # Extract text from slides
+            with progress_lock:
+                progress_tracker[task_id]["current_page"] = 1
+                progress_tracker[task_id]["percentage"] = 50
+            
+            text = process_pptx_file(file_path)
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(text)
+            
+            with progress_lock:
+                progress_tracker[task_id]["percentage"] = 100
+                progress_tracker[task_id]["pages_processed"] = 1
+                
+        elif file_type == 'txt':
+            # Read directly
+            with progress_lock:
+                progress_tracker[task_id]["current_page"] = 1
+                progress_tracker[task_id]["percentage"] = 50
+            
+            text = process_txt_file(file_path)
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(text)
+            
+            with progress_lock:
+                progress_tracker[task_id]["percentage"] = 100
+                progress_tracker[task_id]["pages_processed"] = 1
+                
+        elif file_type == 'spreadsheet':
+            # Extract text from spreadsheets
+            with progress_lock:
+                progress_tracker[task_id]["current_page"] = 1
+                progress_tracker[task_id]["percentage"] = 50
+            
+            ext = filename.rsplit('.', 1)[1].lower()
+            text = process_spreadsheet_file(file_path, ext)
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(text)
+            
+            with progress_lock:
+                progress_tracker[task_id]["percentage"] = 100
+                progress_tracker[task_id]["pages_processed"] = 1
+                
+        elif file_type == 'rtf':
+            # Extract text from RTF
+            with progress_lock:
+                progress_tracker[task_id]["current_page"] = 1
+                progress_tracker[task_id]["percentage"] = 50
+            
+            text = process_rtf_file(file_path)
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(text)
+            
+            with progress_lock:
+                progress_tracker[task_id]["percentage"] = 100
+                progress_tracker[task_id]["pages_processed"] = 1
+                
+        elif file_type == 'opendocument':
+            # Extract text from OpenDocument
+            with progress_lock:
+                progress_tracker[task_id]["current_page"] = 1
+                progress_tracker[task_id]["percentage"] = 50
+            
+            ext = filename.rsplit('.', 1)[1].lower()
+            text = process_opendocument_file(file_path, ext)
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(text)
+            
+            with progress_lock:
+                progress_tracker[task_id]["percentage"] = 100
+                progress_tracker[task_id]["pages_processed"] = 1
+                
+        elif file_type == 'html':
+            # Extract text from HTML
+            with progress_lock:
+                progress_tracker[task_id]["current_page"] = 1
+                progress_tracker[task_id]["percentage"] = 50
+            
+            text = process_html_file(file_path)
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(text)
+            
+            with progress_lock:
+                progress_tracker[task_id]["percentage"] = 100
+                progress_tracker[task_id]["pages_processed"] = 1
+                
+        elif file_type == 'data':
+            # Extract text from XML/JSON
+            with progress_lock:
+                progress_tracker[task_id]["current_page"] = 1
+                progress_tracker[task_id]["percentage"] = 50
+            
+            ext = filename.rsplit('.', 1)[1].lower()
+            text = process_data_file(file_path, ext)
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(text)
+            
+            with progress_lock:
+                progress_tracker[task_id]["percentage"] = 100
+                progress_tracker[task_id]["pages_processed"] = 1
+        
+        # Save progress for non-PDF files before Mega upload attempt
+        _save_progress()
+        
+        # Upload to Mega.nz cloud for permanent storage
+        try:
+            mega_link = upload_to_mega(output_path, output_filename)
+            with progress_lock:
+                progress_tracker[task_id]["download_link"] = mega_link
+                if mega_link:
+                    progress_tracker[task_id]["mega_uploaded"] = True
+                    progress_tracker[task_id]["mega_status"] = "uploaded"
+                    logger.info(f"Task {task_id}: Mega upload success - {mega_link}")
+                    # Clean up checkpoint files on successful upload
+                    try:
+                        m_clean = init_mega()
+                        if m_clean:
+                            cleanup_checkpoints(m_clean, task_id)
+                    except Exception:
+                        pass
+                else:
+                    progress_tracker[task_id]["mega_uploaded"] = False
+                    progress_tracker[task_id]["mega_status"] = "failed: upload_to_mega returned None"
+                    logger.warning(f"Task {task_id}: Mega upload returned None (check Render logs)")
+        except Exception as mega_err:
+            error_msg = str(mega_err)
+            logger.error(f"Task {task_id}: Mega upload error: {error_msg}")
+            with progress_lock:
+                progress_tracker[task_id]["mega_uploaded"] = False
+                progress_tracker[task_id]["mega_status"] = f"failed: {error_msg}"
+
+        # Mark as completed (respect cancel flag)
+        with progress_lock:
+            if not progress_tracker[task_id].get("cancelled"):
+                progress_tracker[task_id]["status"] = "completed"
+            progress_tracker[task_id]["completed_at"] = time.time()
+            progress_tracker[task_id]["download_count"] = progress_tracker[task_id].get("download_count", 0)
+        _save_progress()
+            
+    except Exception as e:
+        logger.error(f"Task {task_id}: Error - {str(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        with progress_lock:
+            progress_tracker[task_id]["status"] = "error"
+            progress_tracker[task_id]["error"] = str(e)
+        _save_progress()
+    finally:
+        _release_keepalive()
+
+def cleanup_old_tasks():
+    """Clean up completed tasks older than 24h. Preserves interrupted/error tasks so users can retry."""
+    current_time = time.time()
+    to_delete = []
+    with progress_lock:
+        for task_id, task in progress_tracker.items():
+            status = task.get("status", "")
+            # Never auto-delete interrupted, error, cancelled, or processing tasks
+            if status in ("interrupted", "error", "cancelled", "cancelling", "processing", "resuming", "starting", "detecting_language", "getting_page_count"):
+                continue
+            if "created_at" not in task:
+                continue
+            # Only delete completed tasks older than 24 hours (increased from 1 hour)
+            if current_time - task["created_at"] > 86400:  # 24 hours
+                to_delete.append(task_id)
+
+        for task_id in to_delete:
+            logger.info(f"Cleaning up old completed task {task_id}")
+            if progress_tracker[task_id].get("temp_dir"):
+                shutil.rmtree(progress_tracker[task_id]["temp_dir"], ignore_errors=True)
+            del progress_tracker[task_id]
+    if to_delete:
+        _save_progress()
+
+
+def upload_to_mega(local_file_path, remote_filename):
+    """Upload a file to Mega.nz ocr-outputs folder and return download link"""
+    email = os.environ.get("MEGA_EMAIL")
+    password = os.environ.get("MEGA_PWD")
+
+    if not email or not password:
+        logger.warning("MEGA_EMAIL/MEGA_PWD not set - skipping cloud upload")
+        return None
+
+    if not os.path.exists(local_file_path):
+        logger.error(f"File not found for upload: {local_file_path}")
+        return None
+
+    from mega import Mega
+
+    mega = Mega()
+    m = mega.login(email, password)
+
+    try:
+        folders = mega_call(m, "find", "ocr-outputs")
+    except Exception:
+        logger.warning("Mega find failed during upload")
+        return None
+    if not folders:
+        logger.info("Creating ocr-outputs folder in Mega")
+        try:
+            folder_node = mega_call(m, "create_folder", "ocr-outputs")
+        except Exception:
+            logger.warning("Mega create_folder failed during upload")
+            return None
+        dest = folder_node.get("ocr-outputs")
+        if not dest:
+            logger.error(f"Failed to get handle from create_folder result: {folder_node}")
+            return None
+    else:
+        dest = folders[0] if isinstance(folders, (list, tuple)) else folders
+
+    logger.info(f"Uploading {remote_filename} to Mega.nz...")
+    logger.info(f"File size: {os.path.getsize(local_file_path)} bytes")
+    try:
+        file_node = mega_call(m, "upload", local_file_path, dest=dest, timeout=120)
+    except Exception:
+        logger.warning("Mega upload failed")
+        return None
+    logger.info(f"Upload completed, getting link...")
+    try:
+        link = mega_call(m, "get_upload_link", file_node)
+    except Exception:
+        logger.warning("Mega get_upload_link failed")
+        return None
+    logger.info(f"Mega.nz upload complete: {link}")
+    return link
+
+
+def rebuild_completed_from_mega():
+    """Scan Mega ocr-outputs folder and restore completed tasks from _ocr.txt files"""
+    email = os.environ.get("MEGA_EMAIL")
+    password = os.environ.get("MEGA_PWD")
+    if not email or not password:
+        return
+
+    try:
+        from mega import Mega
+        m = Mega().login(email, password)
+
+        folder = mega_call(m, "find", "ocr-outputs", timeout=15)
+        if isinstance(folder, (list, tuple)):
+            folder = folder[0] if folder else None
+        if not folder:
+            return
+
+        try:
+            files = mega_call(m, "get_files_in_node", folder, timeout=15)
+        except Exception:
+            return
+
+        if not files:
+            return
+
+        now = time.time()
+        restored = 0
+        for nid, finfo in files.items():
+            if not isinstance(finfo, dict):
+                continue
+            name = finfo.get('a', {}).get('n', '')
+            if not name.endswith('_ocr.txt') or name.startswith('_'):
+                continue
+
+            import hashlib
+            tid = "mega_" + hashlib.md5(name.encode()).hexdigest()[:12]
+
+            with progress_lock:
+                if tid in progress_tracker:
+                    continue
+
+            link = mega_call(m, "get_link", nid, timeout=15)
+            if not link:
+                continue
+
+            orig_name = name[:-8]  # Remove '_ocr.txt'
+            with progress_lock:
+                progress_tracker[tid] = {
+                    "current_page": 0, "status": "completed",
+                    "result_path": None, "error": None,
+                    "filename": orig_name, "output_filename": name,
+                    "download_link": link,
+                    "mega_uploaded": True, "mega_status": "uploaded",
+                    "file_type": "pdf", "detected_language": "",
+                    "pages_processed": 0, "percentage": 100,
+                    "download_count": 0, "completed_at": now, "created_at": now
+                }
+                restored += 1
+
+        if restored:
+            logger.info(f"Restored {restored} completed tasks from Mega folder")
+    except Exception as e:
+        logger.error(f"Failed to scan Mega for completed tasks: {e}")
 
 
 def mega_call(m, method_name, *args, timeout=MEGA_LOGIN_TIMEOUT, **kwargs):
+    """Call a Mega client method with timeout protection. Returns the method's result or raises."""
     fn = getattr(m, method_name)
     pool = ThreadPoolExecutor(max_workers=1)
     try:
@@ -279,55 +1172,72 @@ def mega_call(m, method_name, *args, timeout=MEGA_LOGIN_TIMEOUT, **kwargs):
 
 
 def init_mega():
-    email = os.environ.get("MEGA_EMAIL", "")
-    password = os.environ.get("MEGA_PASSWORD", "")
+    """Initialize and login to Mega.nz with timeout. Returns client or None."""
+    email = os.environ.get("MEGA_EMAIL")
+    password = os.environ.get("MEGA_PWD")
     if not email or not password:
         return None
     try:
+        from mega import Mega
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TimeoutError
         mega = Mega()
-        pool = ThreadPoolExecutor(max_workers=1)
+        ex = ThreadPoolExecutor(max_workers=1)
         try:
-            future = pool.submit(mega.login, email, password)
+            future = ex.submit(mega.login, email, password)
             return future.result(timeout=MEGA_LOGIN_TIMEOUT)
         finally:
-            pool.shutdown(wait=False)
+            ex.shutdown(wait=False)
+    except _TimeoutError:
+        logger.warning("Mega login timed out (network issue?)")
+        return None
     except Exception as e:
         logger.error(f"Mega login failed: {e}")
         return None
 
 
 def ensure_mega_folder(m, folder_name):
+    """Find Mega folder, create if needed. Return folder handle string."""
     try:
-        folder = mega_call(m, "find", folder_name, timeout=15)
+        folder = mega_call(m, "find", folder_name)
     except Exception:
+        logger.warning(f"Mega find failed for folder {folder_name}")
         return None
     if folder:
-        return folder[0] if isinstance(folder, (list, tuple)) else folder
+        return folder[0]
     try:
-        result = mega_call(m, "create_folder", folder_name, timeout=15)
-        return result.get(folder_name)
+        result = mega_call(m, "create_folder", folder_name)
     except Exception:
+        logger.warning(f"Mega create_folder failed for {folder_name}")
         return None
+    return result.get(folder_name)
 
 
 def upload_checkpoint(m, task_id, output_path, metadata):
+    """Upload checkpoint (partial output + metadata) to ocr-checkpoints/ folder in Mega."""
+    import json, tempfile as _tf
     folder_name = "ocr-checkpoints"
     folder_handle = ensure_mega_folder(m, folder_name)
     if not folder_handle:
+        logger.error(f"Cannot access/create {folder_name} in Mega")
         return False
+
+    # Delete old checkpoint file if exists
     try:
-        old_ckpt = mega_call(m, "find", f"{folder_name}/{task_id}.checkpoint", timeout=15)
+        old_ckpt = mega_call(m, "find", f"{folder_name}/{task_id}.checkpoint")
         if old_ckpt:
-            mega_call(m, "delete", old_ckpt[0] if isinstance(old_ckpt, (list, tuple)) else old_ckpt)
+            mega_call(m, "delete", old_ckpt[0])
     except Exception:
         pass
+    # Delete old output file if exists
     try:
-        old_out = mega_call(m, "find", f"{folder_name}/{task_id}_output.txt", timeout=15)
+        old_out = mega_call(m, "find", f"{folder_name}/{task_id}_output.txt")
         if old_out:
-            mega_call(m, "delete", old_out[0] if isinstance(old_out, (list, tuple)) else old_out)
+            mega_call(m, "delete", old_out[0])
     except Exception:
         pass
-    ckpt_file = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8')
+
+    # Upload metadata JSON first
+    ckpt_file = _tf.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8')
     json.dump(metadata, ckpt_file)
     ckpt_file.close()
     try:
@@ -337,98 +1247,269 @@ def upload_checkpoint(m, task_id, output_path, metadata):
         os.unlink(ckpt_file.name)
         return False
     os.unlink(ckpt_file.name)
+
+    # Then upload partial output file
     try:
         mega_call(m, "upload", output_path, dest=folder_handle, dest_filename=f"{task_id}_output.txt", timeout=120)
     except Exception as e:
         logger.error(f"Checkpoint output upload failed: {e}")
         return False
+
     logger.info(f"Checkpoint saved for task {task_id} at page {metadata.get('last_page')}")
     return True
 
 
 def cleanup_checkpoints(m, task_id):
+    """Delete checkpoint files for a completed task."""
     folder_name = "ocr-checkpoints"
     try:
-        old_ckpt = mega_call(m, "find", f"{folder_name}/{task_id}.checkpoint", timeout=15)
+        old_ckpt = mega_call(m, "find", f"{folder_name}/{task_id}.checkpoint")
         if old_ckpt:
-            mega_call(m, "delete", old_ckpt[0] if isinstance(old_ckpt, (list, tuple)) else old_ckpt)
+            mega_call(m, "delete", old_ckpt[0])
     except Exception:
         pass
     try:
-        old_out = mega_call(m, "find", f"{folder_name}/{task_id}_output.txt", timeout=15)
+        old_out = mega_call(m, "find", f"{folder_name}/{task_id}_output.txt")
         if old_out:
-            mega_call(m, "delete", old_out[0] if isinstance(old_out, (list, tuple)) else old_out)
+            mega_call(m, "delete", old_out[0])
     except Exception:
         pass
+    logger.info(f"Checkpoint files cleaned up for task {task_id}")
 
 
-def upload_to_mega(local_file_path, remote_filename):
-    if not os.path.exists(local_file_path):
-        return None
-    m = init_mega()
-    if not m:
-        return None
+def scan_and_resume_checkpoints():
+    """Called at app startup. Scans Mega for checkpoint files and resumes tasks."""
+    logger.info("Scanning for incomplete tasks to resume...")
     try:
-        folder = mega_call(m, "find", "ocr-outputs", timeout=15)
-    except Exception:
-        return None
-    if not folder:
+        m = init_mega()
+        if not m:
+            logger.info("Mega not configured - skipping resume scan")
+            return
+
+        folder_handle = ensure_mega_folder(m, "ocr-checkpoints")
+        if not folder_handle:
+            logger.info("No ocr-checkpoints folder - nothing to resume")
+            return
+
+        files_in_folder = mega_call(m, "get_files_in_node", folder_handle)
+        if not files_in_folder:
+            logger.info("No checkpoint files found")
+            return
+
+        import json, tempfile as _tf
+
+        for handle, node in files_in_folder.items():
+            name = node.get('a', {}).get('n', '')
+            if not name.endswith('.checkpoint'):
+                continue
+            task_id = name[:-len('.checkpoint')]
+
+            logger.info(f"Found incomplete task {task_id}, attempting resume...")
+            try:
+                temp_dir = _tf.mkdtemp()
+                mega_call(m, "download", (handle, node), dest_path=temp_dir)
+
+                ckpt_path = os.path.join(temp_dir, name)
+                with open(ckpt_path, 'r', encoding='utf-8') as f:
+                    metadata = json.load(f)
+
+                output_name = f"{task_id}_output.txt"
+                output_node = mega_call(m, "find", f"ocr-checkpoints/{output_name}")
+                if not output_node:
+                    logger.warning(f"Task {task_id}: Partial output not found, skipping")
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    continue
+                mega_call(m, "download", output_node, dest_path=temp_dir)
+
+                original_name = metadata.get("original_filename", "")
+                original_dl_path = None
+                if original_name:
+                    orig_node = mega_call(m, "find", f"ocr-originals/{original_name}")
+                    if orig_node:
+                        mega_call(m, "download", orig_node, dest_path=temp_dir)
+                        original_dl_path = os.path.join(temp_dir, original_name)
+
+                last_page = metadata.get("last_page", 0)
+                total_pages = metadata.get("total_pages", 0)
+                resume_from = last_page + 1
+
+                if not original_dl_path:
+                    logger.warning(f"Task {task_id}: Original file not found, cannot resume")
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    continue
+
+                if resume_from > total_pages:
+                    logger.info(f"Task {task_id}: Already complete (page {last_page}/{total_pages})")
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    continue
+
+                output_filename = metadata.get("output_filename", f"{os.path.splitext(original_name)[0]}_ocr.txt")
+                partial_path = os.path.join(temp_dir, output_name)
+                new_output_path = os.path.join(temp_dir, output_filename)
+
+                if os.path.exists(partial_path):
+                    os.rename(partial_path, new_output_path)
+
+                detected_lang = metadata.get("detected_lang", "tam")
+                file_type = metadata.get("file_type", "pdf")
+                actual_start = metadata.get("start_page", 1)
+                actual_end = metadata.get("end_page", total_pages)
+
+                with progress_lock:
+                    if task_id in progress_tracker:
+                        logger.info(f"Task {task_id} already in tracker, skipping")
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                        continue
+                    progress_tracker[task_id] = {
+                        "current_page": resume_from,
+                        "status": "resuming",
+                        "result_path": None,
+                        "error": None,
+                        "filename": metadata.get("filename", original_name),
+                        "temp_dir": temp_dir,
+                        "total_pages": total_pages,
+                        "percentage": int((last_page / total_pages) * 100) if total_pages else 0,
+                        "detected_language": detected_lang,
+                        "created_at": time.time(),
+                        "file_type": file_type,
+                        "output_path": new_output_path,
+                        "output_filename": output_filename,
+                        "resumed_from_page": resume_from
+                    }
+
+                logger.info(f"Resuming task {task_id} from page {resume_from}/{total_pages}")
+                thread = threading.Thread(
+                    target=resume_ocr_processing,
+                    args=(task_id, original_dl_path, metadata, new_output_path, temp_dir)
+                )
+                thread.daemon = True
+                thread.start()
+                _ensure_keepalive()
+
+            except Exception as e:
+                logger.error(f"Failed to resume task {task_id}: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+
+    except Exception as e:
+        logger.error(f"Checkpoint scan error: {e}")
+
+
+def resume_ocr_processing(task_id, original_path, metadata, output_path, temp_dir):
+    """Resume OCR from last checkpoint page."""
+    try:
+        last_page = metadata.get("last_page", 0)
+        total_pages = metadata.get("total_pages", 0)
+        detected_lang = metadata.get("detected_lang", "tam")
+        actual_start = metadata.get("start_page", 1)
+        actual_end = metadata.get("end_page", total_pages)
+        filename = metadata.get("filename", "document.pdf")
+        output_filename = metadata.get("output_filename", "document_ocr.txt")
+
+        resume_from = last_page + 1
+        if resume_from > actual_end or (total_pages and resume_from > total_pages):
+            with progress_lock:
+                progress_tracker[task_id]["status"] = "completed"
+                progress_tracker[task_id]["percentage"] = 100
+            logger.info(f"Task {task_id}: Already complete, nothing to resume")
+            return
+
+        with progress_lock:
+            progress_tracker[task_id]["status"] = "processing"
+            progress_tracker[task_id]["total_pages"] = total_pages
+        mega_ckpt = init_mega() if os.environ.get("MEGA_EMAIL") and os.environ.get("MEGA_PWD") else None
+
+        pages_processed = last_page
+        last_checkpoint_pages = last_page
+
+        with open(output_path, 'a', encoding='utf-8') as output_file:
+            current = resume_from
+            while actual_end is None or current <= actual_end:
+                if total_pages and current > total_pages:
+                    break
+
+                batch_end = min(current + BATCH_SIZE - 1, actual_end) if actual_end else current + BATCH_SIZE - 1
+
+                result = process_pdf_ocr(
+                    original_path,
+                    lang=detected_lang,
+                    dpi=200,
+                    task_id=task_id,
+                    output_file=output_file,
+                    start_page=current,
+                    end_page=batch_end
+                )
+                if result == 0:
+                    break
+
+                pages_processed += result
+                current = batch_end + 1
+
+                if mega_ckpt and (pages_processed - last_checkpoint_pages >= CHECKPOINT_INTERVAL):
+                    last_checkpoint_pages = pages_processed
+                    try:
+                        checkpoint_data = {
+                            "task_id": task_id,
+                            "last_page": current - 1,
+                            "total_pages": total_pages,
+                            "filename": filename,
+                            "output_filename": output_filename,
+                            "detected_lang": detected_lang,
+                            "file_type": "pdf",
+                            "start_page": actual_start,
+                            "end_page": actual_end,
+                            "created_at": time.time(),
+                            "original_filename": filename
+                        }
+                        upload_checkpoint(mega_ckpt, task_id, output_path, checkpoint_data)
+                    except Exception as e:
+                        logger.warning(f"Task {task_id}: Resume checkpoint failed: {e}")
+
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            logger.error(f"Task {task_id}: Resumed output empty")
+            with progress_lock:
+                progress_tracker[task_id]["status"] = "error"
+                progress_tracker[task_id]["error"] = "Resumed OCR produced no output"
+            return
+
         try:
-            folder_node = mega_call(m, "create_folder", "ocr-outputs", timeout=15)
-            dest = folder_node.get("ocr-outputs")
-        except Exception:
-            return None
-    else:
-        dest = folder[0] if isinstance(folder, (list, tuple)) else folder
-    if not dest:
-        return None
-    try:
-        file_node = mega_call(m, "upload", local_file_path, dest=dest, timeout=120)
-        link = mega_call(m, "get_upload_link", file_node, timeout=30)
-        return link
+            mega_link = upload_to_mega(output_path, output_filename)
+            with progress_lock:
+                progress_tracker[task_id]["download_link"] = mega_link
+                if mega_link:
+                    progress_tracker[task_id]["mega_uploaded"] = True
+                    progress_tracker[task_id]["mega_status"] = "uploaded"
+                    if mega_ckpt:
+                        try:
+                            cleanup_checkpoints(mega_ckpt, task_id)
+                        except Exception:
+                            pass
+                else:
+                    progress_tracker[task_id]["mega_uploaded"] = False
+                    progress_tracker[task_id]["mega_status"] = "failed: upload_to_mega returned None"
+        except Exception as mega_err:
+            logger.error(f"Task {task_id}: Resume final upload error: {mega_err}")
+            with progress_lock:
+                progress_tracker[task_id]["mega_uploaded"] = False
+                progress_tracker[task_id]["mega_status"] = f"failed: {mega_err}"
+
+        with progress_lock:
+            progress_tracker[task_id]["status"] = "completed"
+            progress_tracker[task_id]["pages_processed"] = pages_processed
+            progress_tracker[task_id]["percentage"] = 100
+            progress_tracker[task_id]["completed_at"] = time.time()
+            progress_tracker[task_id]["download_count"] = progress_tracker[task_id].get("download_count", 0)
+        logger.info(f"Task {task_id}: Resume completed ({pages_processed} pages)")
+
     except Exception as e:
-        logger.error(f"Mega upload failed: {e}")
-        return None
-
-
-def mega_upload_text(text, remote_name):
-    m = get_mega()
-    if m is None:
-        return None
-    tmp = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
-            f.write(text)
-            tmp = f.name
-        file = m.upload(tmp, dest_filename=remote_name)
-        return m.get_link(file)
-    except Exception:
-        return None
+        logger.error(f"Task {task_id}: Resume error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        with progress_lock:
+            progress_tracker[task_id]["status"] = "error"
+            progress_tracker[task_id]["error"] = str(e)
     finally:
-        if tmp and os.path.exists(tmp):
-            os.unlink(tmp)
-
-
-def mega_checkpoint_upload(task_id, text, page_num):
-    m = init_mega()
-    if not m:
-        return None
-    folder = ensure_mega_folder(m, "ocr-checkpoints")
-    if not folder:
-        return None
-    tmp = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
-            f.write(text)
-            tmp = f.name
-        file = m.upload(tmp, dest=folder, dest_filename=f"{task_id}_p{page_num}.txt")
-        return m.get_link(file)
-    except Exception as e:
-        logger.warning(f"Checkpoint upload failed: {e}")
-        return None
-    finally:
-        if tmp and os.path.exists(tmp):
-            os.unlink(tmp)
+        _release_keepalive()
 
 
 def _ensure_keepalive():
@@ -438,7 +1519,7 @@ def _ensure_keepalive():
         if _keepalive_thread is None or not _keepalive_thread.is_alive():
             _keepalive_thread = threading.Thread(target=_keepalive_loop, daemon=True)
             _keepalive_thread.start()
-    _ocr_keepalive_ping()
+            logger.info("Keepalive thread started")
 
 
 def _release_keepalive():
@@ -450,8 +1531,9 @@ def _release_keepalive():
 
 
 def _keepalive_loop():
-    render_url = _get_render_url()
-    local_url = f"http://localhost:{os.environ.get('PORT', 10000)}"
+    render_url = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("RENDER_URL", "")
+    local_url = f"http://localhost:{os.environ.get('PORT', 8080)}"
+
     while True:
         with _keepalive_lock:
             if _active_tasks <= 0:
@@ -459,843 +1541,458 @@ def _keepalive_loop():
         success = False
         if render_url:
             try:
-                requests.get(f"{render_url}/health", timeout=10)
+                requests.get(f"{render_url}/health", timeout=15)
                 success = True
             except Exception:
                 pass
         if not success:
             try:
                 requests.get(f"{local_url}/health", timeout=5)
+                success = True
             except Exception:
                 pass
-        time.sleep(60)
+        if not success:
+            logger.warning("Keepalive: all endpoints unreachable")
+        time.sleep(60)  # Ping every 60s instead of 120s for faster response
 
-
-def detect_language(text):
-    tamil = len(re.findall(r"[\u0B80-\u0BFF]", text))
-    latin = len(re.findall(r"[a-zA-Z]", text))
-    if tamil > latin * 2:
-        return "Tamil"
-    elif tamil > latin / 2:
-        return "Tamil + English"
-    elif latin > 0:
-        return "English"
-    return "Unknown"
-
-
-def calculate_eta(task):
-    elapsed = time.time() - task["start_time"]
-    pages_done = task["current_page"]
-    total = task["total_pages"]
-    if pages_done <= 0 or elapsed <= 0:
-        return ""
-    secs_per_page = elapsed / pages_done
-    if total > 0:
-        remaining = max(0, total - pages_done) * secs_per_page
-    else:
-        remaining = secs_per_page * 50
-    if remaining < 60:
-        return f"{int(remaining)}s"
-    elif remaining < 3600:
-        return f"{int(remaining//60)}m {int(remaining%60)}s"
-    else:
-        return f"{int(remaining//3600)}h {int((remaining%3600)//60)}m"
-
-
-def _get_render_url():
-    return KEEPALIVE_URL or os.environ.get("RENDER_EXTERNAL_URL", "")
 
 def _ocr_keepalive_ping():
-    url = _get_render_url()
-    if url:
-        try:
-            requests.get(f"{url}/health", timeout=10)
-            return
-        except Exception:
-            pass
+    """Secondary keepalive: called from within the OCR thread itself.
+    Pings localhost every 60s so Render doesn't sleep even if the main
+    keepalive thread is delayed or dead."""
     try:
-        local = f"http://localhost:{os.environ.get('PORT', 10000)}"
-        requests.get(f"{local}/health", timeout=5)
+        local_url = f"http://localhost:{os.environ.get('PORT', 8080)}"
+        requests.get(f"{local_url}/health", timeout=5)
     except Exception:
         pass
 
 
-def process_task(task_id, filepath, ext, lang, start_page, end_page, save_mega):
-    task = tasks.get(task_id)
-    if not task:
-        _release_keepalive()
-        return
-    try:
-        task["status"] = "processing"
-        task["start_time"] = time.time()
-        ocr_lang = "tam+eng" if lang == "auto" else lang
-        task["language_display"] = LANG_OPTIONS.get(lang, lang)
-        text_parts = []
-        mega_cp = save_mega
-        last_mega_cp = 0
-        original_uploaded = False
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    if request.method == 'POST':
+        # Check if file was uploaded
+        if 'file' not in request.files:
+            flash('No file selected')
+            return redirect(request.url)
 
-        if ext == ".pdf":
+        file = request.files['file']
+
+        if file.filename == '':
+            flash('No file selected')
+            return redirect(request.url)
+
+        if not allowed_file(file.filename):
+            flash('Unsupported file type')
+            return redirect(request.url)
+        
+        # Detect file type
+        file_type = get_file_type(file.filename)
+        if not file_type:
+            flash('Unsupported file type')
+            return redirect(request.url)
+        
+        # Get language selection (only used for PDF and image)
+        selected_lang = request.form.get('language', 'auto')
+        logger.info(f"Language selection: {selected_lang}")
+        
+        # Get page range (only for PDF)
+        page_range = request.form.get('page_range', 'all')
+        start_page = 1
+        end_page = None
+        
+        if page_range == 'custom':
             try:
-                info = pdfinfo_from_path(filepath)
-                task["total_pages"] = info["pages"]
-            except Exception:
-                task["total_pages"] = 0
-            if task["total_pages"] == 0 and PdfReader:
-                try:
-                    reader = PdfReader(filepath)
-                    task["total_pages"] = len(reader.pages)
-                except Exception:
-                    pass
+                start_page = int(request.form.get('start_page', 1))
+                end_page_str = request.form.get('end_page', '').strip()
+                if end_page_str:
+                    end_page = int(end_page_str)
+                logger.info(f"Custom page range: {start_page} to {end_page}")
+            except ValueError:
+                logger.warning("Invalid page range, using defaults")
+                start_page = 1
+                end_page = None
 
-            if save_mega and not original_uploaded:
-                try:
-                    m = init_mega()
-                    if m:
-                        folder = ensure_mega_folder(m, "ocr-originals")
-                        if folder:
-                            m.upload(filepath, dest=folder, dest_filename=task["filename"])
-                            original_uploaded = True
-                            logger.info(f"Task {task_id}: Original uploaded to ocr-originals")
-                except Exception as e:
-                    logger.warning(f"Task {task_id}: Original upload failed: {e}")
+        # Save uploaded file to temp location
+        filename = secure_filename(file.filename)
+        temp_dir = tempfile.mkdtemp()
+        file_path = os.path.join(temp_dir, filename)
+        file.save(file_path)
+        
+        # Verify file was saved
+        if not os.path.exists(file_path):
+            logger.error(f"Failed to save file to {file_path}")
+            flash('Failed to save uploaded file')
+            return redirect(request.url)
+        
+        logger.info(f"File saved to {file_path}, size: {os.path.getsize(file_path)} bytes")
+        
+        # Create a task ID for progress tracking
+        task_id = str(uuid.uuid4())
+        logger.info(f"Created task {task_id} for file {filename}")
+        
+        # Initialize progress tracker
+        with progress_lock:
+            progress_tracker[task_id] = {
+                "current_page": 0,
+                "status": "starting",
+                "result_path": None,
+                "error": None,
+                "filename": filename,
+                "temp_dir": temp_dir,
+                "file_path": file_path,
+                "total_pages": None,
+                "percentage": 0,
+                "detected_language": selected_lang if selected_lang != 'auto' else None,
+                "selected_lang": selected_lang,
+                "start_page": start_page,
+                "end_page": end_page,
+                "created_at": time.time(),
+                "file_type": file_type,
+                "cancelled": False
+            }
+        _save_progress()
+        
+        # Start background processing thread
+        logger.info(f"Starting background thread for task {task_id}, type: {file_type}")
+        thread = threading.Thread(
+            target=process_file_background,
+            args=(task_id, file_path, filename, temp_dir, selected_lang, start_page, end_page, 200, file_type)
+        )
+        thread.daemon = True
+        thread.start()
+        logger.info(f"Background thread started for task {task_id}")
+        _ensure_keepalive()
+        
+        # Render the processing page with task ID
+        return render_template('processing.html', task_id=task_id)
+    
+    return render_template('index.html')
 
-            page_num = max(1, start_page)
-            no_more_pages = False
-            while True:
-                if task.get("cancelled"):
-                    task["status"] = "cancelled"
-                    task["error"] = "Cancelled by user"
-                    _save_progress(force=True)
-                    return
+@app.route('/progress/<task_id>')
+def get_progress(task_id):
+    """Return progress status as JSON"""
+    try:
+        with progress_lock:
+            if task_id not in progress_tracker:
+                logger.warning(f"Progress check: task {task_id} not found in tracker")
+                return jsonify({"status": "not_found"}), 404
 
-                if end_page is not None and page_num > end_page:
-                    break
-
-                if no_more_pages:
-                    break
-
-                gc.collect()
-                mem = _get_memory_mb()
-                if mem > 400:
-                    logger.warning(f"Task {task_id}: RSS {mem}MB > 400MB, forcing aggressive GC")
-                    gc.collect()
-                    gc.collect()
-
-                images = None
-                timed_out = False
-                try:
-                    pool = ThreadPoolExecutor(max_workers=1)
-                    try:
-                        future = pool.submit(convert_from_path, filepath, dpi=300, first_page=page_num, last_page=page_num)
-                        images = future.result(timeout=CONVERT_TIMEOUT)
-                    except _CTimeoutError:
-                        logger.warning(f"Task {task_id}: Convert timeout on page {page_num}, skipping")
-                        timed_out = True
-                    finally:
-                        pool.shutdown(wait=False)
-
-                    if task.get("cancelled"):
-                        task["status"] = "cancelled"
-                        task["error"] = "Cancelled by user"
-                        _save_progress(force=True)
-                        return
-
-                    if timed_out:
-                        page_num += 1
-                        continue
-
-                    if images is None or len(images) == 0:
-                        no_more_pages = True
-                        break
-
-                    page_text = pytesseract.image_to_string(images[0], lang=ocr_lang)
-                    images[0].close()
-                    del images
-                    gc.collect()
-                    if page_text.strip():
-                        text_parts.append(f"--- Page {page_num} ---\n{page_text}")
-                    task["current_page"] = page_num
-                    task["progress"] = int((page_num / task["total_pages"]) * 100) if task["total_pages"] > 0 else min(page_num, 99)
-                    task["eta"] = calculate_eta(task)
-
-                    if save_mega and (page_num - last_mega_cp) >= 5:
-                        cp_text = "\n\n".join(text_parts)
-                        mega_checkpoint_upload(task_id, cp_text, page_num)
-                        last_mega_cp = page_num
-                        _ocr_keepalive_ping()
-
-                    if page_num > 0 and page_num % 10 == 0:
-                        mem2 = _get_memory_mb()
-                        if mem2:
-                            logger.info(f"Task {task_id}: Page {page_num} done, RSS ~{mem2}MB")
-                        _ocr_keepalive_ping()
-
-                    _save_progress()
-                    page_num += 1
-                except Exception:
-                    break
-            text = "\n\n".join(text_parts)
-            task["progress"] = 100
-        elif ext in IMG_EXTS:
-            with Image.open(filepath) as img:
-                text = pytesseract.image_to_string(img, lang=ocr_lang)
-            task["current_page"] = 1
-            task["total_pages"] = 1
-            task["progress"] = 100
-        elif ext == ".docx":
-            if DocxDocument:
-                doc = DocxDocument(filepath)
-                text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-            else:
-                text = ""
-            task["progress"] = 100
-        elif ext == ".xlsx":
-            if load_workbook:
-                wb = load_workbook(filepath, read_only=True, data_only=True)
-                lines = []
-                for ws in wb.worksheets:
-                    for row in ws.iter_rows(values_only=True):
-                        vals = [str(c) for c in row if c is not None]
-                        if vals:
-                            lines.append("\t".join(vals))
-                wb.close()
-                text = "\n".join(lines)
-            else:
-                text = ""
-            task["progress"] = 100
-        elif ext in TEXT_EXTS:
-            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-                text = f.read()
-            task["progress"] = 100
-        else:
-            text = ""
-            task["progress"] = 100
-
-        if task.get("cancelled"):
-            task["status"] = "cancelled"
-            task["error"] = "Cancelled by user"
-            _save_progress(force=True)
-            return
-
-        if text.strip():
-            if lang == "auto":
-                task["detected_language"] = detect_language(text)
-            task["word_count"] = len(text.split())
-            results[task_id] = text
-            task["status"] = "completed"
-            output_path = task.get("output_path")
-            if output_path:
-                try:
-                    with open(output_path, 'w', encoding='utf-8') as f:
-                        f.write(text)
-                except Exception:
-                    pass
-
-            if save_mega:
-                tmp_out = None
-                try:
-                    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
-                        f.write(text)
-                        tmp_out = f.name
-                    link = upload_to_mega(tmp_out, f"ocr_{task_id}.txt")
-                    if link:
-                        task["mega_link"] = link
-                except Exception:
-                    pass
-                finally:
-                    if tmp_out and os.path.exists(tmp_out):
-                        os.unlink(tmp_out)
-        else:
-            task["status"] = "failed"
-            task["error"] = "No text could be extracted"
-
-        _save_progress(force=True)
-
+            task = progress_tracker[task_id]
+            
+            # Get language code - use selected language if available
+            lang_code = task.get("detected_language")
+            if not lang_code or lang_code == 'auto':
+                lang_code = DEFAULT_LANG
+            
+            lang_name = LANG_CODE_TO_NAME.get(lang_code, lang_code)
+            
+            # Compute ETA
+            eta = None
+            if task["status"] in ("processing", "resuming"):
+                page_times = task.get("page_times")
+                total = task.get("total_pages")
+                current_page = task.get("current_page", 0)
+                start_page_offset = task.get("processing_start_page", 1)
+                if page_times and total and current_page > 0:
+                    avg = sum(page_times) / len(page_times)
+                    pages_done = max(0, current_page - start_page_offset + 1)
+                    remaining = max(0, total - pages_done)
+                    if remaining > 0:
+                        eta = int(avg * remaining)
+            
+            return jsonify({
+                "status": task["status"],
+                "current_page": task["current_page"],
+                "total_pages": task.get("total_pages"),
+                "pdf_total_pages": task.get("pdf_total_pages"),
+                "percentage": task.get("percentage", 0),
+                "error": task["error"],
+                "filename": task["filename"],
+                "detected_language": lang_code,
+                "language_name": lang_name,
+                "file_type": task.get("file_type", "pdf"),
+                "eta": eta
+            })
     except Exception as e:
-        task["status"] = "failed"
-        task["error"] = str(e)
-        _save_progress(force=True)
-    finally:
-        _release_keepalive()
-        try:
-            if os.path.exists(filepath):
-                os.unlink(filepath)
-        except Exception:
-            pass
+        logger.error(f"Progress endpoint error for {task_id}: {e}")
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 
-def render_page(title, content, active, flashes=None):
-    if flashes is None:
-        flashes = []
-    return render_template_string(HTML_HEADER + content + HTML_CLOSING, title=title, active=active, flashes=flashes)
+@app.route('/check/<task_id>')
+def check_progress_page(task_id):
+    """Styled HTML progress page for checking task status."""
+    return render_template('progress_check.html', task_id=task_id)
 
 
-@app.route("/progress/<task_id>")
-def progress_api(task_id):
-    task = tasks.get(task_id)
-    if not task:
-        return jsonify({"found": False})
-    tp = task["total_pages"]
-    display_total = tp if tp > 0 else "?"
-    return jsonify({
-        "found": True,
-        "task_id": task["task_id"],
-        "filename": task["filename"],
-        "status": task["status"],
-        "progress": task["progress"],
-        "current_page": task["current_page"],
-        "total_pages": tp,
-        "display_total": str(display_total),
-        "language_display": task.get("language_display", ""),
-        "detected_language": task.get("detected_language", ""),
-        "word_count": task["word_count"],
-        "eta": task.get("eta", ""),
-        "error": task.get("error", ""),
-        "mega_link": task.get("mega_link", ""),
-    })
+@app.route('/download/<task_id>')
+def download_result(task_id):
+    """Download OCR result file"""
+    with progress_lock:
+        if task_id not in progress_tracker:
+            flash('Task not found')
+            return redirect(url_for('index'))
+
+        task = progress_tracker[task_id]
+
+        if task["status"] != "completed":
+            flash('Processing not completed')
+            return redirect(url_for('index'))
+
+        if not task["output_path"] or not os.path.exists(task["output_path"]):
+            flash('Result file not found')
+            return redirect(url_for('index'))
+
+        # Send file as download
+        response = send_file(
+            task["output_path"],
+            as_attachment=True,
+            download_name=task["output_filename"],
+            mimetype='text/plain'
+        )
+
+        # Track download count
+        with progress_lock:
+            progress_tracker[task_id]["download_count"] = progress_tracker[task_id].get("download_count", 0) + 1
+
+        # Cleanup after sending (optional, can keep for debugging)
+        # shutil.rmtree(task["temp_dir"], ignore_errors=True)
+        # with progress_lock:
+        #     del progress_tracker[task_id]
+
+        return response
 
 
-@app.route("/task/<task_id>")
-def task_page(task_id):
-    task = tasks.get(task_id)
-    if not task:
-        flash("Task not found", "error")
-        return redirect("/")
-    return render_page(f"Processing - {task['filename']}", build_task_html(task), "upload")
+@app.route('/track-download/<task_id>', methods=['POST'])
+def track_download(task_id):
+    """Increment download count for cloud (Mega) link clicks"""
+    with progress_lock:
+        if task_id in progress_tracker:
+            progress_tracker[task_id]["download_count"] = progress_tracker[task_id].get("download_count", 0) + 1
+            return jsonify({"ok": True}), 200
+    return jsonify({"ok": False}), 404
 
 
-def build_task_html(task):
-    task_id = task["task_id"]
-    status_icon = "\u23F3" if task["status"] in ("processing", "queued") else ("\u2705" if task["status"] == "completed" else "\u274C")
-    status_text = task["status"].title()
-    eta_text = task.get("eta", "")
-    detected = task.get("detected_language", "")
-    word_count = task["word_count"]
-    pct = task["progress"]
-    mega_link = task.get("mega_link", "")
-
-    extra = ""
-    if task["status"] == "completed":
-        extra = f'''<div class="progress-actions">
-            <a href="/download/{task_id}" class="btn btn-primary btn-sm">\U0001F4E5 Download .txt</a>
-            <a href="/" class="btn btn-secondary btn-sm">\U0001F504 Process Another</a>
-        </div>'''
-        if mega_link:
-            extra += f'''<p style="margin-top:0.8rem;text-align:center;"><a href="{mega_link}" target="_blank" style="color:var(--accent);font-weight:600;">\U0001F310 Download from Mega Cloud</a></p>'''
-        if detected:
-            extra += f'<p style="color:#666;margin-top:0.5rem;text-align:center;">Detected language: <strong>{detected}</strong></p>'
-        if word_count:
-            extra += f'<p style="color:#666;text-align:center;">{word_count} words extracted</p>'
-    elif task["status"] == "failed":
-        extra = f'''<p style="color:#721c24;text-align:center;">Error: {task.get("error", "Unknown error")}</p>
-            <div class="progress-actions">
-                <a href="/" class="btn btn-primary btn-sm">\U0001F504 Try Again</a>
-                <button class="btn btn-secondary btn-sm" onclick="retryTask('{task_id}')">\U0001F504 Retry</button>
-            </div>'''
-    elif task["status"] == "cancelled":
-        extra = f'''<p style="color:#856404;text-align:center;">Task was cancelled.</p>
-            <div class="progress-actions">
-                <a href="/" class="btn btn-primary btn-sm">\U0001F504 Upload Again</a>
-            </div>'''
-
-    cancel_btn = ""
-    if task["status"] in ("processing", "queued"):
-        cancel_btn = '''<div class="progress-actions">
-            <button class="btn btn-danger btn-sm" onclick="cancelTask()">\u2716 Cancel</button>
-            <a href="/downloads" class="btn btn-secondary btn-sm">\U0001F4E6 My Downloads</a>
-        </div>'''
-
-    polling_js = ""
-    if task["status"] in ("processing", "queued"):
-        polling_js = f'''<script>
-        function poll() {{
-            fetch("/progress/{task_id}").then(function(r){{return r.json()}}).then(function(d){{
-                if(d.found && (d.status==="processing"||d.status==="queued")){{
-                    var p=d.progress||0;
-                    document.querySelector(".progress-bar-fill").style.width=p+"%";
-                    document.querySelectorAll(".progress-stat")[1].querySelector(".value").textContent=p+"%";
-                    document.querySelectorAll(".progress-stat")[2].querySelector(".value").textContent=(d.current_page||0)+"/"+(d.display_total||"?")
-                    document.querySelectorAll(".progress-stat")[4].querySelector(".value").textContent=d.eta||"";
-                    setTimeout(poll,2000);
-                }} else if(d.found && (d.status==="completed"||d.status==="failed"||d.status==="cancelled")){{
-                    location.reload();
-                }}
-            }});
-        }}
-        function cancelTask() {{
-            fetch("/cancel/{task_id}",{{method:"POST"}}).then(function(r){{return r.json()}}).then(function(d){{
-                location.reload();
-            }});
-        }}
-        poll();
-        </script>'''
-
-    return f'''<div class="container progress-page">
-        <div class="card">
-            <div class="task-id">Task: {task_id}</div>
-            <div class="progress-filename">{task["filename"]}</div>
-            <div class="progress-status">
-                <div class="progress-stat"><div class="value">{status_icon}</div><div class="label">Status</div></div>
-                <div class="progress-stat"><div class="value">{pct}%</div><div class="label">Progress</div></div>
-                <div class="progress-stat"><div class="value">{task["current_page"]}/{task["total_pages"] if task["total_pages"] > 0 else "?"}</div><div class="label">Pages</div></div>
-                <div class="progress-stat"><div class="value">{task.get("language_display","")}</div><div class="label">Language</div></div>
-                <div class="progress-stat"><div class="value">{eta_text}</div><div class="label">ETA</div></div>
-            </div>
-            <div class="progress-bar-bg"><div class="progress-bar-fill" style="width:{pct}%"></div></div>
-            {cancel_btn}
-            {extra}
-        </div>
-    </div>
-    {polling_js}'''
+@app.route('/preview/<task_id>')
+def preview_text(task_id):
+    """Return first 1000 chars of OCR result for preview"""
+    with progress_lock:
+        task = progress_tracker.get(task_id)
+        if not task or task.get("status") != "completed":
+            return jsonify({"error": "Not available"}), 404
+        output_path = task.get("output_path")
+    if not output_path or not os.path.exists(output_path):
+        return jsonify({"text": "File not found"})
+    try:
+        with open(output_path, 'r', encoding='utf-8', errors='replace') as f:
+            text = f.read(1000)
+        return jsonify({"text": text})
+    except Exception as e:
+        return jsonify({"text": f"Error reading file: {e}"})
 
 
-@app.route("/cancel/<task_id>", methods=['POST'])
+@app.route('/cancel/<task_id>', methods=['POST'])
 def cancel_task(task_id):
-    with tasks_lock:
-        task = tasks.get(task_id)
+    """Cancel a running OCR task"""
+    with progress_lock:
+        task = progress_tracker.get(task_id)
         if not task:
             return jsonify({"error": "Task not found"}), 404
-        if task["status"] not in ("processing", "queued", "starting"):
+        if task["status"] not in ("processing", "resuming", "starting", "detecting_language", "getting_page_count"):
             return jsonify({"error": "Task is not running"}), 400
         task["cancelled"] = True
+        task["status"] = "cancelling"
+    _save_progress()
+    logger.info(f"Task {task_id}: Cancel requested")
     return jsonify({"status": "cancelling"}), 200
 
 
-@app.route("/retry/<task_id>", methods=['POST'])
+@app.route('/retry/<task_id>', methods=['POST'])
 def retry_task(task_id):
-    with tasks_lock:
-        old = tasks.get(task_id)
+    """Retry a failed OCR task"""
+    with progress_lock:
+        old = progress_tracker.get(task_id)
         if not old:
             return jsonify({"error": "Task not found"}), 404
-        if old.get("status") not in ("failed", "cancelled"):
-            return jsonify({"error": "Only failed or cancelled tasks can be retried"}), 400
+        if old.get("status") not in ("error", "interrupted", "completed_with_error"):
+            return jsonify({"error": "Only failed or interrupted tasks can be retried"}), 400
+
         filename = old.get("filename", "input.pdf")
-        ext = old.get("ext", ".pdf")
-        lang = old.get("language", "auto")
-        start_page = old.get("start_page", 1)
-        end_page = old.get("end_page", None)
+        file_type = old.get("file_type", "pdf")
+        temp_dir = old.get("temp_dir")
+        file_path = old.get("file_path")
+        selected_lang = old.get("selected_lang", "auto")
+        last_ckpt = old.get("last_checkpoint_page", 0)
+        current_page = old.get("current_page", 0)
+        end_page = old.get("end_page")
+        old_total = old.get("total_pages")
+        mega_node = old.get("mega_original_handle")
+        detected_lang = old.get("detected_language")
 
-    new_id = os.urandom(8).hex()
-    new_task = {
-        "task_id": new_id,
-        "filename": filename,
-        "ext": ext,
-        "language": lang,
-        "status": "queued",
-        "progress": 0,
-        "current_page": 0,
-        "total_pages": 0,
-        "word_count": 0,
-        "detected_language": old.get("detected_language", ""),
-        "language_display": old.get("language_display", LANG_OPTIONS.get(lang, lang)),
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "eta": "",
-        "start_time": time.time(),
-        "mega_link": "",
-        "start_page": start_page,
-        "end_page": end_page,
-    }
+    # Everything after here is outside the lock
 
-    with tasks_lock:
-        tasks[new_id] = new_task
-        tasks_order.insert(0, new_id)
+    # Try to locate the original file
+    src = file_path or (os.path.join(temp_dir, filename) if temp_dir else None)
+    needs_new_temp = False
 
-    flash("Retry task created. Please upload the file again.", "info")
-    return redirect(f"/task/{new_id}")
-
-
-@app.route("/preview/<task_id>")
-def preview_text(task_id):
-    text = results.get(task_id)
-    if text is None:
-        task = tasks.get(task_id)
-        output_path = task.get("output_path") if task else None
-        if output_path and os.path.exists(output_path):
+    if not src or not os.path.exists(src):
+        if mega_node:
+            new_temp = tempfile.mkdtemp()
+            src = os.path.join(new_temp, filename)
             try:
-                with open(output_path, 'r', encoding='utf-8', errors='replace') as f:
-                    text = f.read(2000)
-                return jsonify({"text": text[:2000]})
-            except Exception:
-                pass
-        return jsonify({"text": "Preview not available."})
-    return jsonify({"text": text[:2000]})
+                m = init_mega()
+                mega_call(m, "download", mega_node, dest_path=src, timeout=120)
+                needs_new_temp = True
+                logger.info(f"Task {task_id}: Downloaded original from Mega for retry")
+            except Exception as e:
+                shutil.rmtree(new_temp, ignore_errors=True)
+                return jsonify({"error": f"Mega download failed: {e}"}), 400
+        else:
+            return jsonify({"error": "Original file not found and no Mega backup"}), 400
+
+    # Create new task
+    new_id = str(uuid.uuid4())
+    new_temp_dir = tempfile.mkdtemp() if needs_new_temp else temp_dir
+    if needs_new_temp:
+        shutil.copy2(src, os.path.join(new_temp_dir, filename))
+        src = os.path.join(new_temp_dir, filename)
+    else:
+        src = file_path
+
+    # Resume from last known page, not from page 1
+    resume_start = (last_ckpt or current_page or 0) + 1
+    if resume_start < 1:
+        resume_start = 1
+
+    with progress_lock:
+        progress_tracker[new_id] = {
+            "current_page": resume_start - 1,
+            "status": "starting",
+            "result_path": None,
+            "error": None,
+            "filename": filename,
+            "temp_dir": new_temp_dir,
+            "file_path": src,
+            "total_pages": old_total,
+            "percentage": 0,
+            "detected_language": detected_lang,
+            "selected_lang": selected_lang,
+            "start_page": resume_start,
+            "end_page": end_page,
+            "created_at": time.time(),
+            "file_type": file_type,
+            "cancelled": False,
+            "retry_of": task_id
+        }
+    _save_progress()
+
+    thread = threading.Thread(
+        target=process_file_background,
+        args=(new_id, src, filename, new_temp_dir, selected_lang, resume_start, end_page, 200, file_type)
+    )
+    thread.daemon = True
+    thread.start()
+    _ensure_keepalive()
+
+    return jsonify({"task_id": new_id}), 200
 
 
-@app.route("/health")
+@app.route('/health')
 def health():
+    """Health check endpoint for Render"""
     try:
         version = pytesseract.get_tesseract_version()
-        langs = pytesseract.get_languages()
-        return {"status": "healthy", "tesseract_version": str(version), "languages_available": langs}, 200
+        # Check if Tamil and English packs are available
+        languages = pytesseract.get_languages()
+        return {
+            'status': 'healthy',
+            'tesseract_version': str(version),
+            'languages_available': languages
+        }, 200
     except Exception as e:
-        return {"status": "unhealthy", "error": str(e)}, 500
-
-
-@app.route("/downloads")
-def downloads():
-    all_tasks = []
-    with tasks_lock:
-        for tid in tasks_order:
-            t = tasks.get(tid)
-            if t:
-                all_tasks.append(t)
-
-    processing = [t for t in all_tasks if t["status"] in ("processing", "queued")]
-    completed = [t for t in all_tasks if t["status"] == "completed"]
-    cancelled = [t for t in all_tasks if t["status"] == "cancelled"]
-    failed = [t for t in all_tasks if t["status"] == "failed"]
-
-    parts = []
-
-    if processing:
-        rows = ""
-        for t in processing:
-            pct = t["progress"]
-            tid = t["task_id"]
-            rows += f'''<tr>
-                <td>{t["filename"]}</td>
-                <td>\u23F3 {pct}%</td>
-                <td><span class="status-badge processing">\u23F3 Processing</span></td>
-                <td>{t.get("eta","")}</td>
-                <td class="actions"><a href="/task/{tid}" class="btn btn-primary btn-sm">View</a></td>
-            </tr>'''
-        parts.append(f'''<h3 class="section-title">\u23F3 Processing</h3>
-            <div style="overflow-x:auto;"><table class="download-table"><thead><tr><th>File</th><th>Progress</th><th>Status</th><th>ETA</th><th>Action</th></tr></thead>
-            <tbody>{rows}</tbody></table></div>''')
-
-    if completed:
-        rows = ""
-        for t in completed:
-            tid = t["task_id"]
-            mega_link = t.get("mega_link", "")
-            dl = f'<a href="/download/{tid}" class="btn btn-primary btn-sm">\U0001F4E5 Download</a>'
-            if mega_link:
-                dl += f' <a href="{mega_link}" target="_blank" class="btn btn-secondary btn-sm">\U0001F310 Mega</a>'
-            dl += f' <button class="btn btn-secondary btn-sm" onclick="previewText(\'{tid}\')">\U0001F50D Preview</button>'
-            rows += f'''<tr>
-                <td>{t["filename"]}</td>
-                <td>{t["word_count"]}</td>
-                <td><span class="status-badge completed">\u2705 Completed</span></td>
-                <td class="actions">{dl}</td>
-            </tr>'''
-        parts.append(f'''<h3 class="section-title">\u2705 Completed</h3>
-            <div style="overflow-x:auto;"><table class="download-table"><thead><tr><th>File</th><th>Words</th><th>Status</th><th>Action</th></tr></thead>
-            <tbody>{rows}</tbody></table></div>''')
-
-    if failed:
-        rows = ""
-        for t in failed:
-            tid = t["task_id"]
-            rows += f'''<tr>
-                <td>{t["filename"]}</td>
-                <td><span class="status-badge failed">\u274C Failed</span></td>
-                <td style="color:#721c24;font-size:0.85rem;">{t.get("error","")[:50]}</td>
-                <td class="actions">
-                    <a href="/task/{tid}" class="btn btn-secondary btn-sm">Details</a>
-                    <button class="btn btn-primary btn-sm" onclick="retryTask('{tid}')">\U0001F504 Retry</button>
-                </td>
-            </tr>'''
-        parts.append(f'''<h3 class="section-title">\u274C Failed</h3>
-            <div style="overflow-x:auto;"><table class="download-table"><thead><tr><th>File</th><th>Status</th><th>Error</th><th>Action</th></tr></thead>
-            <tbody>{rows}</tbody></table></div>''')
-
-    if cancelled:
-        rows = ""
-        for t in cancelled:
-            tid = t["task_id"]
-            rows += f'''<tr>
-                <td>{t["filename"]}</td>
-                <td><span class="status-badge interrupted">\u23F8 Cancelled</span></td>
-                <td></td>
-                <td class="actions">
-                    <button class="btn btn-primary btn-sm" onclick="retryTask('{tid}')">\U0001F504 Retry</button>
-                </td>
-            </tr>'''
-        parts.append(f'''<h3 class="section-title">\u23F8 Cancelled</h3>
-            <div style="overflow-x:auto;"><table class="download-table"><thead><tr><th>File</th><th>Status</th><th>Error</th><th>Action</th></tr></thead>
-            <tbody>{rows}</tbody></table></div>''')
-
-    if not parts:
-        content = '''<div class="container">
-            <div class="page-title"><h2>\U0001F4E6 Downloads</h2></div>
-            <div class="card" style="text-align:center;padding:4rem 2rem;">
-                <p style="font-size:1.2rem;color:#666;">No downloads yet.</p>
-                <p style="margin-top:1rem;"><a href="/" class="btn btn-primary">\U0001F4C4 Upload a file</a></p>
-            </div>
-        </div>'''
-    else:
-        content = f'''<div class="container">
-            <div class="page-title"><h2>\U0001F4E6 Downloads</h2></div>
-            <div class="card">{"".join(parts)}</div>
-        </div>
-        <div id="preview-modal" class="modal-overlay">
-            <div class="modal-content">
-                <button class="modal-close" onclick="closePreview()">&times;</button>
-                <h3>\U0001F50D Preview</h3>
-                <pre id="preview-text">Loading...</pre>
-            </div>
-        </div>
-        <script>
-        function previewText(tid) {{
-            document.getElementById("preview-text").textContent = "Loading...";
-            document.getElementById("preview-modal").classList.add("active");
-            fetch("/preview/"+tid).then(function(r){{return r.json()}}).then(function(d){{
-                document.getElementById("preview-text").textContent = d.text || "No preview available.";
-            }});
-        }}
-        function closePreview() {{
-            document.getElementById("preview-modal").classList.remove("active");
-        }}
-        document.getElementById("preview-modal").addEventListener("click", function(e) {{
-            if(e.target === this) closePreview();
-        }});
-        function retryTask(tid) {{
-            if(!confirm("Create a retry task for this file?")) return;
-            fetch("/retry/"+tid, {{method:"POST"}}).then(function(r){{
-                if(r.redirected) {{ window.location.href = r.url; }}
-                else {{ location.reload(); }}
-            }});
-        }}
-        </script>'''
-
-    return render_page("Downloads", content, "downloads")
-
-
-@app.route("/download/<task_id>")
-def download_file(task_id):
-    text = results.get(task_id)
-    if text is None:
-        task = tasks.get(task_id)
-        output_path = task.get("output_path") if task else None
-        if output_path and os.path.exists(output_path):
-            try:
-                with open(output_path, 'r', encoding='utf-8') as f:
-                    text = f.read()
-            except Exception:
-                pass
-    if text is None:
-        flash("Download not found or expired.", "error")
-        return redirect("/downloads")
-    task = tasks.get(task_id, {})
-    base = task.get("filename", "ocr_result")
-    name = os.path.splitext(base)[0] + ".txt"
-    return send_file(
-        BytesIO(text.encode("utf-8")),
-        mimetype="text/plain",
-        as_attachment=True,
-        download_name=name,
-    )
-
-
-@app.route("/", methods=["GET", "POST"])
-def index():
-    if request.method == "POST":
-        f = request.files.get("file")
-        if not f or not f.filename:
-            flash("Please select a file to upload.", "error")
-            return redirect("/")
-
-        ext = os.path.splitext(f.filename.lower())[1]
-        lang = request.form.get("lang", "auto")
-        start_page = request.form.get("start_page", "1")
-        end_page = request.form.get("end_page", "")
-        save_mega = request.form.get("save_mega") == "on"
-
-        if ext not in SUPPORTED_EXTS:
-            flash("Unsupported file type: " + ext, "error")
-            return redirect("/")
-
-        sp = max(1, int(start_page)) if start_page.isdigit() else 1
-        ep = int(end_page) if end_page.isdigit() else None
-
-        try:
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
-            f.save(tmp.name)
-            tmppath = tmp.name
-            tmp.close()
-        except Exception as e:
-            flash("Error saving file: " + str(e), "error")
-            return redirect("/")
-
-        task_id = os.urandom(8).hex()
-        task = {
-            "task_id": task_id,
-            "filename": f.filename,
-            "ext": ext,
-            "language": lang,
-            "status": "queued",
-            "progress": 0,
-            "current_page": 0,
-            "total_pages": 0,
-            "word_count": 0,
-            "detected_language": "",
-            "language_display": LANG_OPTIONS.get(lang, lang),
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "eta": "",
-            "start_time": time.time(),
-            "mega_link": "",
-            "start_page": sp,
-            "end_page": ep,
-            "cancelled": False,
-        }
-
-        if ext == ".pdf" and (MEGA_AVAILABLE and MEGA_EMAIL and MEGA_PASSWORD):
-            try:
-                output_dir = tempfile.mkdtemp()
-                output_path = os.path.join(output_dir, f"ocr_{task_id}.txt")
-                task["output_path"] = output_path
-            except Exception:
-                pass
-
-        with tasks_lock:
-            tasks[task_id] = task
-            tasks_order.insert(0, task_id)
-        _save_progress()
-
-        t = threading.Thread(
-            target=process_task,
-            args=(task_id, tmppath, ext, lang, sp, ep, save_mega),
-            daemon=True,
-        )
-        t.start()
-        _ensure_keepalive()
-
-        return redirect(f"/task/{task_id}")
-
-    lang_opts = ""
-    for val, label in LANG_OPTIONS.items():
-        sel = " selected" if val == "auto" else ""
-        lang_opts += f'<option value="{val}"{sel}>{label}</option>'
-
-    mega_checks = ""
-    if MEGA_AVAILABLE and MEGA_EMAIL and MEGA_PASSWORD:
-        mega_checks = '''<div class="form-row">
-            <label><input type="checkbox" name="save_mega" checked> Save to Mega Cloud</label>
-        </div>'''
-
-    doc_btns = ""
-    for key, dt in DOC_TYPES.items():
-        active_cls = " active" if key == "pdf" else ""
-        doc_btns += f'<button type="button" class="doc-type-btn{active_cls}" data-type="{key}" data-ext="{",".join(dt["exts"])}">{dt["icon"]} {dt["label"]}</button>'
-
-    content = f'''<div class="container">
-        <div class="page-title"><h2>\U0001F4C4 Upload Document</h2></div>
-        <div class="card">
-            <form method="post" enctype="multipart/form-data" id="upload-form">
-                <div class="doc-types" id="doc-types">
-                    {doc_btns}
-                </div>
-                <input type="hidden" name="doc_type" id="doc-type-input" value="pdf">
-                <div class="file-upload-area" id="file-area">
-                    <div class="upload-icon">\U0001F4C1</div>
-                    <p>Click or drag file here</p>
-                    <div class="file-name" id="file-name"></div>
-                    <input type="file" name="file" id="file-input" accept=".pdf" required>
-                </div>
-                <div class="form-row">
-                    <select name="lang" id="lang">{lang_opts}</select>
-                    <input type="number" name="start_page" placeholder="From page" min="1" value="1">
-                    <input type="number" name="end_page" placeholder="To (blank = all)" min="1">
-                </div>
-                {mega_checks}
-                <button type="submit" class="upload-btn" id="submit-btn">\U0001F4E4 Upload &amp; Extract</button>
-            </form>
-        </div>
-    </div>
-    <script>
-    (function(){{
-        var typeInput = document.getElementById("doc-type-input");
-        var fileInput = document.getElementById("file-input");
-        var fileArea = document.getElementById("file-area");
-        var fileName = document.getElementById("file-name");
-        var btns = document.querySelectorAll(".doc-type-btn");
-        btns.forEach(function(b){{
-            b.addEventListener("click",function(){{
-                btns.forEach(function(x){{x.classList.remove("active")}});
-                this.classList.add("active");
-                typeInput.value = this.getAttribute("data-type");
-                fileInput.accept = "." + this.getAttribute("data-ext").replace(/,/g, ",.");
-                fileInput.value = "";
-                fileName.textContent = "";
-                fileArea.classList.remove("has-file");
-                fileInput.click();
-            }});
-        }});
-        fileArea.addEventListener("click",function(){{
-            fileInput.click();
-        }});
-        fileInput.addEventListener("change",function(){{
-            if(this.files && this.files[0]){{
-                fileName.textContent = this.files[0].name;
-                fileArea.classList.add("has-file");
-            }}
-        }});
-    }})();
-    </script>'''
-
-    return render_page("Upload", content, "upload")
+        return {'status': 'unhealthy', 'error': str(e)}, 500
 
 
 @app.errorhandler(413)
 def too_large(e):
-    flash("File too large. Maximum size is 200MB.", "error")
-    return redirect("/")
+    flash('File too large. Maximum size is 100MB.')
+    return redirect(url_for('index'))
 
 
+@app.route('/downloads')
+def downloads_page():
+    all_tasks = []
+    with progress_lock:
+        for task_id, task in progress_tracker.items():
+            status = task.get("status", "")
+
+            # Compute ETA for in-progress tasks
+            eta = None
+            if status in ("processing", "resuming"):
+                page_times = task.get("page_times")
+                total = task.get("total_pages")
+                current_page = task.get("current_page", 0)
+                start_page_offset = task.get("processing_start_page", 1)
+                if page_times and total and current_page > 0:
+                    avg = sum(page_times) / len(page_times)
+                    pages_done = max(0, current_page - start_page_offset + 1)
+                    remaining = max(0, total - pages_done)
+                    if remaining > 0:
+                        eta = int(avg * remaining)
+
+            info = {
+                "task_id": task_id,
+                "filename": task.get("output_filename", task.get("filename", "Unknown")),
+                "download_link": task.get("download_link", ""),
+                "language": task.get("detected_language", ""),
+                "file_type": task.get("file_type", ""),
+                "pages_processed": task.get("pages_processed", 0),
+                "mega_uploaded": task.get("mega_uploaded", False),
+                "mega_status": task.get("mega_status", ""),
+                "completed_at": task.get("completed_at", 0),
+                "created_at": task.get("created_at", 0),
+                "download_count": task.get("download_count", 0),
+                "status": status,
+                "percentage": task.get("percentage", 0),
+                "eta": eta,
+                "last_checkpoint_page": task.get("last_checkpoint_page")
+            }
+            all_tasks.append(info)
+    all_tasks.reverse()
+    return render_template("downloads.html", downloads=all_tasks)
+
+
+
+# Startup: scan Mega for incomplete tasks and resume them
 def _startup_resume():
-    time.sleep(5)
+    time.sleep(10)  # Wait for server to be ready
     with app.app_context():
+        # Load persisted progress from JSON file
         saved = _load_progress()
-        restored = 0
-        with tasks_lock:
-            for tid, data in saved.items():
-                if tid not in tasks:
-                    data["status"] = "interrupted" if data.get("status") not in ("completed", "failed") else data["status"]
-                    if "cancelled" in data and data.get("cancelled"):
-                        data["status"] = "cancelled"
-                    data["start_time"] = time.time()
-                    data["eta"] = ""
-                    data["mega_link"] = data.get("mega_link", "")
-                    tasks[tid] = data
-                    tasks_order.append(tid)
-                    restored += 1
-        if restored:
-            _save_progress(force=True)
-            logger.info(f"Startup: restored {restored} tasks from {PROGRESS_FILE}")
+        if saved:
+            with progress_lock:
+                for tid, data in saved.items():
+                    # Preserve cancelled/error status; rest become interrupted
+                    if data.get("status") not in ("completed", "error", "cancelled"):
+                        data["status"] = "interrupted"
+                    progress_tracker[tid] = data
+            logger.info(f"Restored {len(saved)} persisted tasks from {PROGRESS_FILE}")
+        scan_and_resume_checkpoints()
+        rebuild_completed_from_mega()
 
+threading.Thread(target=_startup_resume, daemon=True).start()
 
+# Periodic cleanup of old temp files (every hour)
 def _cleanup_loop():
     while True:
         time.sleep(3600)
         try:
-            now = time.time()
-            to_delete = []
-            with tasks_lock:
-                for tid, task in tasks.items():
-                    if task.get("status") == "completed" and "created_at" in task:
-                        try:
-                            ct = datetime.strptime(task["created_at"], "%Y-%m-%d %H:%M").timestamp()
-                            if now - ct > 86400:
-                                to_delete.append(tid)
-                        except Exception:
-                            pass
-            for tid in to_delete:
-                with tasks_lock:
-                    tasks.pop(tid, None)
-                    results.pop(tid, None)
-                    if tid in tasks_order:
-                        tasks_order.remove(tid)
-            if to_delete:
-                _save_progress()
-                logger.info(f"Cleanup: removed {len(to_delete)} old completed tasks")
+            cleanup_old_tasks()
         except Exception:
             pass
 
-
-threading.Thread(target=_startup_resume, daemon=True).start()
 threading.Thread(target=_cleanup_loop, daemon=True).start()
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+if __name__ == '__main__':
+    # Local testing only (Render uses Gunicorn)
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)

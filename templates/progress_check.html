@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Progress - Siva OCR</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <header>
+        <div class="header-container">
+            <div class="logo">
+                <h1>Siva OCR</h1>
+            </div>
+            <nav>
+                <a href="/downloads" style="color: white; text-decoration: none; font-weight: 600;">
+                    <i class="fas fa-download"></i> My Downloads
+                </a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <section class="content-section processing-section">
+            <h2><i class="fas fa-spinner fa-pulse"></i> Task Progress</h2>
+            <p class="page-info" id="filename"></p>
+
+            <div id="status-box">
+                <div class="loading-spinner" id="spinner"></div>
+                <div class="progress-text" id="percentage-text">0%</div>
+                <div class="progress-status" id="status-text">Loading progress...</div>
+
+                <div class="progress-container">
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progress-fill"></div>
+                    </div>
+                </div>
+
+                <div class="status-info">
+                    <div class="status-card">
+                        <h4>Detected Language</h4>
+                        <p id="detected-lang">Detecting...</p>
+                    </div>
+                    <div class="status-card" id="page-info-section">
+                        <h4>Progress</h4>
+                        <p id="page-info">Page <span id="current-page">0</span> / <span id="total-pages">...</span></p>
+                    </div>
+                    <div class="status-card">
+                        <h4>File Type</h4>
+                        <p id="file-type">---</p>
+                    </div>
+                    <div class="status-card" id="eta-section2">
+                        <h4>ETA</h4>
+                        <p id="eta-text2">--</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="flash" id="error-box" style="display: none;">
+                <strong>Error:</strong> <span id="error-text"></span>
+            </div>
+
+            <div class="flash" id="not-found-box" style="display: none;">
+                <strong>Task not found.</strong> The task ID may be invalid or already expired.
+            </div>
+
+            <div style="margin-top: 2rem; display: flex; gap: 1rem; justify-content: center;">
+                <a href="/" class="submit-btn" style="text-decoration: none;">
+                    <i class="fas fa-home"></i> Back to Home
+                </a>
+                <a href="/downloads" class="submit-btn" id="downloads-btn" style="text-decoration: none; background: linear-gradient(135deg, #64748b 0%, #475569 100%);">
+                    <i class="fas fa-download"></i> My Downloads
+                </a>
+                <button class="submit-btn" id="cancel-btn" style="display: none; background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%); border: none; cursor: pointer;">
+                    <i class="fas fa-times-circle"></i> Cancel
+                </button>
+            </div>
+
+            <div class="task-id-box">
+                <p>
+                    <i class="fas fa-info-circle"></i>
+                    Task ID: <strong>{{ task_id }}</strong>
+                </p>
+                <p class="task-id-hint">
+                    Bookmark this page to check progress later.
+                </p>
+            </div>
+        </section>
+    </main>
+
+    <style>
+        .task-id-box {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            padding: 1rem;
+            margin-top: 1.5rem;
+            text-align: center;
+        }
+        .task-id-box p {
+            margin: 0;
+            font-size: 13px;
+            color: #666;
+        }
+        .task-id-box strong {
+            color: var(--git-color);
+        }
+        .task-id-hint {
+            margin-top: 4px !important;
+            font-size: 12px !important;
+            color: #999 !important;
+        }
+        .content-section h2 {
+            text-align: center;
+            margin-bottom: 1.5rem;
+        }
+    </style>
+
+    <script>
+        const taskId = "{{ task_id }}";
+        const statusText = document.getElementById('status-text');
+        const pageInfoSection = document.getElementById('page-info-section');
+        const currentPage = document.getElementById('current-page');
+        const totalPages = document.getElementById('total-pages');
+        const percentageText = document.getElementById('percentage-text');
+        const progressFill = document.getElementById('progress-fill');
+        const spinner = document.getElementById('spinner');
+        const errorBox = document.getElementById('error-box');
+        const notFoundBox = document.getElementById('not-found-box');
+        const errorText = document.getElementById('error-text');
+        const filenameEl = document.getElementById('filename');
+        const detectedLang = document.getElementById('detected-lang');
+        const fileTypeEl = document.getElementById('file-type');
+        const etaText = document.getElementById('eta-text2');
+        const etaSection = document.getElementById('eta-section2');
+        const cancelBtn = document.getElementById('cancel-btn');
+
+        let currentETA = null;
+        let etaTimer = null;
+
+        function startETACountdown(seconds) {
+            currentETA = seconds;
+            if (etaTimer) clearInterval(etaTimer);
+            etaTimer = setInterval(() => {
+                currentETA = Math.max(0, currentETA - 1);
+                etaText.textContent = formatETA(currentETA);
+                if (currentETA <= 0) {
+                    clearInterval(etaTimer);
+                    etaTimer = null;
+                }
+            }, 1000);
+            etaText.textContent = formatETA(currentETA);
+            etaSection.style.display = 'block';
+        }
+
+        function stopETACountdown() {
+            if (etaTimer) {
+                clearInterval(etaTimer);
+                etaTimer = null;
+            }
+            currentETA = null;
+        }
+
+        function cancelProcessing() {
+            if (!confirm('Cancel this OCR task?')) return;
+            fetch('/cancel/' + taskId, { method: 'POST' })
+                .then(r => r.json())
+                .then(d => {
+                    statusText.textContent = 'Cancelling...';
+                    cancelBtn.style.display = 'none';
+                })
+                .catch(() => {});
+        }
+
+        function formatETA(seconds) {
+            if (!seconds || seconds <= 0) return '--';
+            if (seconds < 60) return `${seconds}s`;
+            if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            return `${h}h ${m}m`;
+        }
+
+        function updateProgress() {
+            fetch(`/progress/${taskId}`)
+                .then(response => {
+                    if (!response.ok) {
+                        if (response.status === 404) {
+                            notFoundBox.style.display = 'block';
+                            statusText.textContent = 'Task not found';
+                            spinner.style.display = 'none';
+                            clearInterval(pollInterval);
+                        }
+                        throw new Error('Task not found');
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    if (data.filename) {
+                        filenameEl.textContent = `File: ${data.filename}`;
+                    }
+                    if (data.language_name) {
+                        detectedLang.textContent = data.language_name;
+                    } else if (data.detected_language) {
+                        detectedLang.textContent = data.detected_language === 'tam' ? 'Tamil' : 'English';
+                    }
+                    if (data.file_type) {
+                        fileTypeEl.textContent = data.file_type.toUpperCase();
+                    }
+
+                    if (data.file_type === 'pdf') {
+                        pageInfoSection.style.display = 'block';
+                        currentPage.textContent = data.current_page;
+                        if (data.pdf_total_pages && data.total_pages && data.pdf_total_pages !== data.total_pages) {
+                            totalPages.textContent = data.pdf_total_pages + ` (range: ${data.total_pages} pages)`;
+                        } else if (data.total_pages) {
+                            totalPages.textContent = data.total_pages;
+                        } else {
+                            totalPages.textContent = '...';
+                        }
+                    } else {
+                        pageInfoSection.style.display = 'none';
+                    }
+
+                    if (data.status === 'detecting_language') {
+                        statusText.textContent = 'Detecting language...';
+                        percentageText.textContent = '...';
+                        progressFill.style.width = '5%';
+                        cancelBtn.style.display = 'inline-block';
+                    } else if (data.status === 'getting_page_count') {
+                        statusText.textContent = 'Getting page count...';
+                        percentageText.textContent = '...';
+                        progressFill.style.width = '10%';
+                        cancelBtn.style.display = 'inline-block';
+                    } else if (data.status === 'starting') {
+                        statusText.textContent = 'Starting processing...';
+                        percentageText.textContent = '0%';
+                        progressFill.style.width = '0%';
+                        cancelBtn.style.display = 'inline-block';
+                    } else if (data.status === 'processing' || data.status === 'resuming') {
+                        const label = data.status === 'resuming' ? 'Resuming' : 'Processing';
+                        statusText.textContent = `${label} ${data.file_type.toUpperCase()}... (${data.language_name || data.detected_language || 'Detected language'})`;
+                        cancelBtn.style.display = 'inline-block';
+                        if (data.percentage > 0) {
+                            percentageText.textContent = `${data.percentage}%`;
+                            progressFill.style.width = `${data.percentage}%`;
+                        }
+                        if (data.eta) {
+                            startETACountdown(data.eta);
+                        } else {
+                            stopETACountdown();
+                            etaText.textContent = '--';
+                            etaSection.style.display = 'block';
+                        }
+                    } else if (data.status === 'completed') {
+                        statusText.textContent = 'Processing completed successfully!';
+                        percentageText.textContent = '100%';
+                        stopETACountdown();
+                        cancelBtn.style.display = 'none';
+                        etaSection.style.display = 'none';
+                        progressFill.style.width = '100%';
+                        spinner.style.display = 'none';
+                        errorBox.style.display = 'none';
+                        clearInterval(pollInterval);
+                    } else if (data.status === 'interrupted') {
+                        statusText.textContent = 'Processing interrupted (server restarted)';
+                        spinner.style.display = 'none';
+                        percentageText.textContent = `${data.percentage || 0}%`;
+                        progressFill.style.width = `${data.percentage || 0}%`;
+                        cancelBtn.style.display = 'none';
+                        stopETACountdown();
+                        etaSection.style.display = 'none';
+                        clearInterval(pollInterval);
+                    } else if (data.status === 'error') {
+                        statusText.textContent = 'Processing failed';
+                        spinner.style.display = 'none';
+                        errorBox.style.display = 'block';
+                        errorText.textContent = data.error || 'Unknown error occurred';
+                        cancelBtn.style.display = 'none';
+                        stopETACountdown();
+                        etaSection.style.display = 'none';
+                        clearInterval(pollInterval);
+                    } else if (data.status === 'cancelling') {
+                        statusText.textContent = 'Cancelling...';
+                        spinner.style.display = 'none';
+                        cancelBtn.style.display = 'none';
+                        stopETACountdown();
+                        etaText.textContent = '--';
+                        etaSection.style.display = 'block';
+                    } else if (data.status === 'cancelled') {
+                        statusText.textContent = 'Task cancelled';
+                        spinner.style.display = 'none';
+                        errorBox.style.display = 'block';
+                        errorText.textContent = data.error || 'Cancelled by user';
+                        cancelBtn.style.display = 'none';
+                        stopETACountdown();
+                        etaSection.style.display = 'none';
+                        clearInterval(pollInterval);
+                    }
+                })
+                .catch(error => {
+                    if (error.message === 'Task not found') return;
+                    statusText.textContent = 'Error checking progress';
+                    console.error('Progress check failed:', error);
+                });
+        }
+
+        const pollInterval = setInterval(updateProgress, 2000);
+        updateProgress();
+    </script>
+</body>
+</html>

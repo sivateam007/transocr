@@ -87,6 +87,7 @@ progress_tracker = {}  # task_id: { ... }
 PROGRESS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "progress_tracker.json")
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocr-outputs")
 _last_save_time = 0
+_mega_restore_done = threading.Event()
 
 def _save_progress(force=False):
     """Save progress_tracker to JSON file with throttling (max 1 write/sec)."""
@@ -2054,6 +2055,7 @@ def clear_downloads():
 @app.route('/downloads')
 def downloads_page():
     all_tasks = []
+    restoring = not _mega_restore_done.is_set()
     with progress_lock:
         for task_id, task in progress_tracker.items():
             status = task.get("status", "")
@@ -2091,11 +2093,11 @@ def downloads_page():
             }
             all_tasks.append(info)
     all_tasks.reverse()
-    return render_template("downloads.html", downloads=all_tasks)
+    return render_template("downloads.html", downloads=all_tasks, restoring=restoring)
 
 
 
-# Load all state synchronously before first request (slow but reliable)
+# Fast local restore (synchronous, <1s), Mega scan in background (fast with deferred links)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 saved = _load_progress()
 if saved:
@@ -2106,8 +2108,6 @@ if saved:
     logger.info(f"Restored {len(saved)} persisted tasks from {PROGRESS_FILE}")
 
 rebuild_completed_from_local()
-rebuild_completed_from_mega()
-scan_and_resume_checkpoints()
 
 with progress_lock:
     for tid, data in progress_tracker.items():
@@ -2118,6 +2118,19 @@ with progress_lock:
                 alt = os.path.join(OUTPUT_DIR, f"{tid}_{out_fn}") if out_fn else None
                 if alt and os.path.exists(alt):
                     data["output_path"] = alt
+
+if os.environ.get("MEGA_EMAIL") and os.environ.get("MEGA_PWD"):
+    def _mega_background():
+        try:
+            rebuild_completed_from_mega()
+            scan_and_resume_checkpoints()
+        except Exception:
+            logger.error("Mega background restore failed", exc_info=True)
+        finally:
+            _mega_restore_done.set()
+    threading.Thread(target=_mega_background, daemon=True).start()
+else:
+    _mega_restore_done.set()
 
 # Periodic cleanup of old temp files (every hour)
 def _cleanup_loop():

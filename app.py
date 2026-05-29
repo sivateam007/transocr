@@ -244,21 +244,28 @@ def _auto_translate_and_upload(task_id):
         return None
     if not text.strip():
         return None
+    api_key = os.environ.get("AZURE_TRANSLATE_KEY")
+    if not api_key:
+        logger.warning("Task {task_id}: AZURE_TRANSLATE_KEY not set, skipping auto-translate")
+        return None
     try:
-        body = {"q": text, "target": target_lang}
         resp = requests.post(
-            "https://libretranslate.com/translate",
-            json=body, timeout=120,
-            headers={"Content-Type": "application/json"}
+            "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=" + target_lang,
+            json=[{"Text": text}],
+            timeout=120,
+            headers={
+                "Ocp-Apim-Subscription-Key": api_key,
+                "Content-Type": "application/json"
+            }
         )
         if resp.status_code != 200:
-            logger.error(f"Task {task_id}: LibreTranslate returned {resp.status_code}")
+            logger.error(f"Task {task_id}: Microsoft Translator returned {resp.status_code}: {resp.text}")
             return None
         result = resp.json()
-        if "error" in result:
-            logger.error(f"Task {task_id}: LibreTranslate error: {result['error']}")
+        if not result or not isinstance(result, list) or not result[0].get("translations"):
+            logger.error(f"Task {task_id}: Microsoft Translator bad response: {result}")
             return None
-        translated = result.get("translatedText")
+        translated = result[0]["translations"][0]["text"]
         if not translated:
             return None
         import tempfile as _tf
@@ -2046,7 +2053,7 @@ def preview_text(task_id):
 
 @app.route('/translate', methods=['POST'])
 def translate_text():
-    """Translate full OCR result using LibreTranslate (free) and save to Mega ocr-translated folder."""
+    """Translate full OCR result using Microsoft Translator (free tier) and save to Mega ocr-translated folder."""
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"error": "No data provided"}), 400
@@ -2076,22 +2083,29 @@ def translate_text():
     if not text.strip():
         return jsonify({"error": "Output file is empty"}), 400
 
+    api_key = os.environ.get("AZURE_TRANSLATE_KEY")
+    if not api_key:
+        return jsonify({"error": "Translation not configured (set AZURE_TRANSLATE_KEY)"}), 500
+
     try:
-        body = {"q": text, "target": target}
+        url = "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=" + target
         if source:
-            body["source"] = source
+            url += "&from=" + source
         resp = requests.post(
-            "https://libretranslate.com/translate",
-            json=body,
-            timeout=60,
-            headers={"Content-Type": "application/json"}
+            url,
+            json=[{"Text": text}],
+            timeout=120,
+            headers={
+                "Ocp-Apim-Subscription-Key": api_key,
+                "Content-Type": "application/json"
+            }
         )
-        if resp.status_code == 429:
-            return jsonify({"error": "Translation rate limited. Try again later."}), 429
+        if resp.status_code != 200:
+            return jsonify({"error": f"Translation API returned {resp.status_code}"}), resp.status_code
         result = resp.json()
-        if "error" in result:
-            return jsonify({"error": result["error"]}), 500
-        translated = result.get("translatedText")
+        if not result or not isinstance(result, list) or not result[0].get("translations"):
+            return jsonify({"error": "Translation API bad response"}), 500
+        translated = result[0]["translations"][0]["text"]
         if not translated:
             return jsonify({"error": "Translation returned empty"}), 500
 

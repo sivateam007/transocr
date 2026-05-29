@@ -9,3 +9,5 @@ services:
         sync: false
       - key: MEGA_PWD
         sync: false
+      - key: AZURE_TRANSLATE_KEY
+        sync: false

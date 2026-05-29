@@ -1964,7 +1964,7 @@ def preview_text(task_id):
 
 @app.route('/translate', methods=['POST'])
 def translate_text():
-    """Translate full OCR result using Google Cloud Translation API and save to Mega ocr-translated folder."""
+    """Translate full OCR result using LibreTranslate (free) and save to Mega ocr-translated folder."""
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"error": "No data provided"}), 400
@@ -1994,25 +1994,24 @@ def translate_text():
     if not text.strip():
         return jsonify({"error": "Output file is empty"}), 400
 
-    api_key = os.environ.get("GOOGLE_TRANSLATE_KEY")
-    if not api_key:
-        return jsonify({"error": "Translation not configured (set GOOGLE_TRANSLATE_KEY)"}), 500
-
     try:
-        params = {"q": text, "target": target, "key": api_key}
+        body = {"q": text, "target": target}
         if source:
-            params["source"] = source
+            body["source"] = source
         resp = requests.post(
-            "https://translation.googleapis.com/language/translate/v2",
-            params=params,
-            timeout=60
+            "https://libretranslate.com/translate",
+            json=body,
+            timeout=60,
+            headers={"Content-Type": "application/json"}
         )
+        if resp.status_code == 429:
+            return jsonify({"error": "Translation rate limited. Try again later."}), 429
         result = resp.json()
-        if "data" not in result or "translations" not in result["data"]:
-            return jsonify({"error": result.get("error", {}).get("message", "Translation failed")}), 500
-        t = result["data"]["translations"][0]
-        translated = t["translatedText"]
-        detected_source = t.get("detectedSourceLanguage")
+        if "error" in result:
+            return jsonify({"error": result["error"]}), 500
+        translated = result.get("translatedText")
+        if not translated:
+            return jsonify({"error": "Translation returned empty"}), 500
 
         # Save translated text to Mega ocr-translated folder
         mega_link = None
@@ -2034,7 +2033,7 @@ def translate_text():
         except Exception as e:
             logger.error(f"Failed to upload translated file to Mega for {task_id}: {e}")
 
-        resp_data = {"translated": translated, "detected_source": detected_source}
+        resp_data = {"translated": translated}
         if mega_link:
             resp_data["mega_link"] = mega_link
         return jsonify(resp_data)

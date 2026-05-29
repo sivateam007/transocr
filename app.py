@@ -2310,6 +2310,23 @@ def health():
         return result, 500
 
 
+@app.route('/debug')
+def debug():
+    import subprocess as _sp
+    out = {}
+    for cmd in [['which', 'tesseract'], ['tesseract', '--version'], ['apt-get', '--version']]:
+        try:
+            r = _sp.run(cmd, capture_output=True, timeout=10)
+            out[' '.join(cmd)] = {'rc': r.returncode, 'stdout': r.stdout.decode(errors='replace')[:500], 'stderr': r.stderr.decode(errors='replace')[:500]}
+        except Exception as e:
+            out[' '.join(cmd)] = str(e)
+    out['tesseract_cmd'] = pytesseract.pytesseract.tesseract_cmd
+    out['shutil_which'] = shutil.which('tesseract')
+    out['isfile_usr'] = os.path.isfile('/usr/bin/tesseract')
+    avail = os.path.exists('/usr/lib/x86_64-linux-gnu/tesseract-ocr') or os.path.exists('/usr/share/tesseract-ocr')
+    out['tessdata_avail'] = avail
+    return out, 200
+
 @app.errorhandler(413)
 def too_large(e):
     flash('File too large. Maximum size is 100MB.')

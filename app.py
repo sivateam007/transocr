@@ -577,7 +577,7 @@ def process_pdf_ocr(pdf_path, lang=DEFAULT_LANG, dpi=200, task_id=None, output_f
                     if translated_output_file and translate_to and not text.startswith("[OCR failed"):
                         translated_text = _translate_text(text, translate_to, source_lang=from_code)
                         if translated_text:
-                            translated_output_file.write(f"--- Page {page} ---\n{translated_text}\n\n")
+                            translated_output_file.write(f"{translated_text}\n\n")
                             translated_output_file.flush()
                     pages_processed += 1
                     if task_id:
@@ -634,7 +634,7 @@ def process_pdf_ocr(pdf_path, lang=DEFAULT_LANG, dpi=200, task_id=None, output_f
             if translated_output_file and translate_to:
                 translated_text = _translate_text(text, translate_to, source_lang=from_code)
                 if translated_text:
-                    translated_output_file.write(f"--- Page {page} ---\n{translated_text}\n\n")
+                    translated_output_file.write(f"{translated_text}\n\n")
                     translated_output_file.flush()
             pages_processed += 1
             if task_id:

@@ -121,6 +121,9 @@
                                 <a href="{{ d.download_link }}" target="_blank" onclick="trackDownload('{{ d.task_id }}')" style="color: var(--git-color); font-weight: 600; text-decoration: none; margin-right: 0.5rem;">
                                     <i class="fas fa-cloud-download-alt"></i>
                                 </a>
+                                <a href="/download-docx/{{ d.task_id }}" style="color: #2563eb; font-weight: 600; text-decoration: none; margin-right: 0.5rem;">
+                                    <i class="fas fa-file-word"></i> DOCX
+                                </a>
                                 <button onclick="openPreview('{{ d.task_id }}')" style="background: none; border: 1px solid #ddd; border-radius: 4px; padding: 0.25rem 0.5rem; cursor: pointer; font-size: 13px;">
                                     <i class="fas fa-eye"></i> Preview
                                 </button>
@@ -128,12 +131,18 @@
                                 <button onclick="getMegaLink('{{ d.task_id }}', this)" style="color: var(--git-color); font-weight: 600; background: none; border: 1px solid var(--git-color); border-radius: 4px; padding: 0.25rem 0.75rem; cursor: pointer; font-size: 13px;">
                                     <i class="fas fa-link"></i> Get Link
                                 </button>
+                                <a href="/download-docx/{{ d.task_id }}" style="color: #2563eb; font-weight: 600; text-decoration: none; margin: 0 0.5rem;">
+                                    <i class="fas fa-file-word"></i> DOCX
+                                </a>
                                 <button onclick="openPreview('{{ d.task_id }}')" style="background: none; border: 1px solid #ddd; border-radius: 4px; padding: 0.25rem 0.5rem; cursor: pointer; font-size: 13px;">
                                     <i class="fas fa-eye"></i> Preview
                                 </button>
                                 {% elif d.status == 'completed' %}
                                 <a href="/download/{{ d.task_id }}" style="color: var(--git-color); font-weight: 600; text-decoration: none; margin-right: 0.5rem;">
                                     <i class="fas fa-download"></i> Download
+                                </a>
+                                <a href="/download-docx/{{ d.task_id }}" style="color: #2563eb; font-weight: 600; text-decoration: none; margin-right: 0.5rem;">
+                                    <i class="fas fa-file-word"></i> DOCX
                                 </a>
                                 <button onclick="openPreview('{{ d.task_id }}')" style="background: none; border: 1px solid #ddd; border-radius: 4px; padding: 0.25rem 0.5rem; cursor: pointer; font-size: 13px;">
                                     <i class="fas fa-eye"></i> Preview
@@ -172,9 +181,42 @@
     </main>
     <!-- Preview Modal -->
     <div id="preview-modal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); z-index: 1000;">
-        <div style="background: white; margin: 5% auto; padding: 2rem; max-width: 700px; max-height: 70vh; overflow-y: auto; border-radius: 12px; position: relative;">
+        <div style="background: white; margin: 5% auto; padding: 2rem; max-width: 700px; max-height: 80vh; overflow-y: auto; border-radius: 12px; position: relative;">
             <h3 style="margin-top: 0;"><i class="fas fa-file-alt"></i> OCR Preview</h3>
-            <pre id="preview-content" style="white-space: pre-wrap; font-size: 14px; line-height: 1.6; background: #f8f9fa; padding: 1rem; border-radius: 8px; max-height: 50vh; overflow-y: auto;"></pre>
+            <pre id="preview-content" style="white-space: pre-wrap; font-size: 14px; line-height: 1.6; background: #f8f9fa; padding: 1rem; border-radius: 8px; max-height: 30vh; overflow-y: auto;"></pre>
+
+            <div id="translate-section" style="margin-top: 1rem; border-top: 1px solid #eee; padding-top: 1rem;">
+                <h4 style="margin-bottom: 0.5rem;"><i class="fas fa-language"></i> Translate</h4>
+                <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center;">
+                    <select id="translate-target-lang" style="padding: 0.4rem 0.6rem; border: 1px solid #ccc; border-radius: 6px; font-size: 13px;">
+                        <option value="en">English</option>
+                        <option value="hi">Hindi</option>
+                        <option value="ta">Tamil</option>
+                        <option value="ml">Malayalam</option>
+                        <option value="te">Telugu</option>
+                        <option value="kn">Kannada</option>
+                        <option value="bn">Bengali</option>
+                        <option value="gu">Gujarati</option>
+                        <option value="mr">Marathi</option>
+                        <option value="pa">Punjabi</option>
+                        <option value="ur">Urdu</option>
+                        <option value="es">Spanish</option>
+                        <option value="fr">French</option>
+                        <option value="de">German</option>
+                        <option value="zh">Chinese</option>
+                        <option value="ja">Japanese</option>
+                        <option value="ko">Korean</option>
+                        <option value="ar">Arabic</option>
+                        <option value="ru">Russian</option>
+                    </select>
+                    <button id="translate-btn" onclick="doTranslate()" style="padding: 0.4rem 1rem; background: #2563eb; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 13px;">
+                        <i class="fas fa-language"></i> Translate
+                    </button>
+                    <span id="translate-status" style="font-size: 12px; color: #666;"></span>
+                </div>
+                <pre id="translated-content" style="display: none; white-space: pre-wrap; font-size: 14px; line-height: 1.6; background: #f0f7ff; padding: 1rem; border-radius: 8px; margin-top: 0.5rem; max-height: 30vh; overflow-y: auto;"></pre>
+            </div>
+
             <div style="text-align: right; margin-top: 1rem;">
                 <button onclick="closePreview()" style="padding: 0.5rem 2rem; background: var(--git-color); color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: 600;">
                     <i class="fas fa-times"></i> Close
@@ -252,7 +294,12 @@
                 .catch(function(){});
         }
 
+        var _currentPreviewTaskId = null;
+
         function openPreview(taskId) {
+            _currentPreviewTaskId = taskId;
+            document.getElementById('translated-content').style.display = 'none';
+            document.getElementById('translate-status').textContent = '';
             fetch('/preview/' + taskId)
                 .then(r => { if (!r.ok) throw new Error('No preview'); return r.json(); })
                 .then(d => {
@@ -267,6 +314,37 @@
 
         function closePreview() {
             document.getElementById('preview-modal').style.display = 'none';
+        }
+
+        function doTranslate() {
+            var text = document.getElementById('preview-content').textContent;
+            if (!text || text === 'No preview available' || text === 'Preview not available') return;
+            var target = document.getElementById('translate-target-lang').value;
+            var btn = document.getElementById('translate-btn');
+            var status = document.getElementById('translate-status');
+            btn.disabled = true;
+            status.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Translating...';
+            fetch('/translate', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({text: text, target_lang: target})
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                if (d.translated) {
+                    document.getElementById('translated-content').textContent = d.translated;
+                    document.getElementById('translated-content').style.display = 'block';
+                    status.textContent = 'Source: ' + (d.detected_source || 'auto');
+                } else {
+                    status.textContent = 'Error: ' + (d.error || 'failed');
+                }
+            })
+            .catch(function() {
+                status.textContent = 'Translation request failed';
+            })
+            .finally(function() {
+                btn.disabled = false;
+            });
         }
 
         function cancelTask(taskId) {

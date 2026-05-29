@@ -193,6 +193,31 @@ _active_tasks = 0
 _keepalive_lock = threading.Lock()
 _keepalive_thread = None
 
+# Cached Mega client (reused across calls to avoid repeated logins)
+_mega_client = None
+_mega_client_lock = threading.Lock()
+
+def _get_mega_client():
+    """Return cached Mega client, logging in only on first call."""
+    global _mega_client
+    if _mega_client is not None:
+        return _mega_client
+    email = os.environ.get("MEGA_EMAIL")
+    password = os.environ.get("MEGA_PWD")
+    if not email or not password:
+        return None
+    with _mega_client_lock:
+        if _mega_client is not None:
+            return _mega_client
+        try:
+            from mega import Mega
+            _mega_client = Mega().login(email, password)
+            logger.info("Mega client logged in (cached)")
+        except Exception as e:
+            logger.error(f"Mega login failed: {e}")
+            _mega_client = None
+    return _mega_client
+
 # Secondary keepalive: each active OCR thread also pings itself
 _ocr_keepalive_running = threading.Event()
 
@@ -1781,7 +1806,7 @@ def get_progress(task_id):
             })
     except Exception as e:
         logger.error(f"Progress endpoint error for {task_id}: {e}")
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return jsonify({"status": "error", "error": "Failed to get progress"}), 500
 
 
 @app.route('/check/<task_id>')
@@ -1828,6 +1853,55 @@ def download_result(task_id):
         return response
 
 
+@app.route('/download-docx/<task_id>')
+def download_docx(task_id):
+    """Download OCR result as a Word document."""
+    with progress_lock:
+        if task_id not in progress_tracker:
+            flash('Task not found')
+            return redirect(url_for('index'))
+        task = progress_tracker[task_id]
+        if task["status"] != "completed":
+            flash('Processing not completed')
+            return redirect(url_for('index'))
+        if not task["output_path"] or not os.path.exists(task["output_path"]):
+            flash('Result file not found')
+            return redirect(url_for('index'))
+
+    from docx import Document
+    from io import BytesIO
+
+    try:
+        with open(task["output_path"], 'r', encoding='utf-8') as f:
+            content = f.read()
+    except Exception:
+        flash('Error reading result file')
+        return redirect(url_for('index'))
+
+    doc = Document()
+    for para in content.split('\n\n'):
+        stripped = para.strip()
+        if stripped:
+            doc.add_paragraph(stripped)
+
+    buf = BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+
+    docx_filename = task.get("output_filename", "output.txt")
+    docx_filename = docx_filename.rsplit('.', 1)[0] + '.docx'
+
+    with progress_lock:
+        progress_tracker[task_id]["download_count"] = progress_tracker[task_id].get("download_count", 0) + 1
+
+    return send_file(
+        buf,
+        as_attachment=True,
+        download_name=docx_filename,
+        mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    )
+
+
 @app.route('/track-download/<task_id>', methods=['POST'])
 def track_download(task_id):
     """Increment download count for cloud (Mega) link clicks"""
@@ -1867,7 +1941,7 @@ def get_mega_link(task_id):
         return jsonify({"link": link}), 200
     except Exception as e:
         logger.error(f"Failed to get Mega link for {task_id}: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Failed to get download link"}), 500
 
 
 @app.route('/preview/<task_id>')
@@ -1884,8 +1958,42 @@ def preview_text(task_id):
         with open(output_path, 'r', encoding='utf-8', errors='replace') as f:
             text = f.read(1000)
         return jsonify({"text": text})
-    except Exception as e:
-        return jsonify({"text": f"Error reading file: {e}"})
+    except Exception:
+        return jsonify({"text": "Error reading file"})
+
+
+@app.route('/translate', methods=['POST'])
+def translate_text():
+    """Translate text using Google Cloud Translation API."""
+    data = request.get_json(silent=True)
+    if not data or not data.get("text"):
+        return jsonify({"error": "No text provided"}), 400
+    text = data["text"]
+    target = data.get("target_lang", "en")
+    source = data.get("source_lang")
+
+    api_key = os.environ.get("GOOGLE_TRANSLATE_KEY")
+    if not api_key:
+        return jsonify({"error": "Translation not configured"}), 500
+
+    try:
+        params = {"q": text, "target": target, "key": api_key}
+        if source:
+            params["source"] = source
+        resp = requests.post(
+            "https://translation.googleapis.com/language/translate/v2",
+            params=params,
+            timeout=15
+        )
+        result = resp.json()
+        if "data" in result and "translations" in result["data"]:
+            t = result["data"]["translations"][0]
+            return jsonify({"translated": t["translatedText"], "detected_source": t.get("detectedSourceLanguage")})
+        return jsonify({"error": result.get("error", {}).get("message", "Translation failed")}), 500
+    except requests.exceptions.Timeout:
+        return jsonify({"error": "Translation timed out"}), 500
+    except Exception:
+        return jsonify({"error": "Translation failed"}), 500
 
 
 @app.route('/cancel/<task_id>', methods=['POST'])
@@ -1943,7 +2051,7 @@ def retry_task(task_id):
                 logger.info(f"Task {task_id}: Downloaded original from Mega for retry")
             except Exception as e:
                 shutil.rmtree(new_temp, ignore_errors=True)
-                return jsonify({"error": f"Mega download failed: {e}"}), 400
+                return jsonify({"error": "Failed to download original from cloud"}), 400
         else:
             return jsonify({"error": "Original file not found and no Mega backup"}), 400
 

@@ -1964,17 +1964,39 @@ def preview_text(task_id):
 
 @app.route('/translate', methods=['POST'])
 def translate_text():
-    """Translate text using Google Cloud Translation API."""
+    """Translate full OCR result using Google Cloud Translation API and save to Mega ocr-translated folder."""
     data = request.get_json(silent=True)
-    if not data or not data.get("text"):
-        return jsonify({"error": "No text provided"}), 400
-    text = data["text"]
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
     target = data.get("target_lang", "en")
     source = data.get("source_lang")
+    task_id = data.get("task_id")
+
+    if not task_id:
+        return jsonify({"error": "task_id required"}), 400
+
+    # Read the full output file
+    with progress_lock:
+        task = progress_tracker.get(task_id)
+        if not task or task.get("status") != "completed":
+            return jsonify({"error": "Task not completed or not found"}), 404
+        output_path = task.get("output_path")
+        base_filename = task.get("output_filename", "output.txt")
+    if not output_path or not os.path.exists(output_path):
+        return jsonify({"error": "Output file not found"}), 404
+
+    try:
+        with open(output_path, 'r', encoding='utf-8', errors='replace') as f:
+            text = f.read()
+    except Exception:
+        return jsonify({"error": "Failed to read output file"}), 500
+
+    if not text.strip():
+        return jsonify({"error": "Output file is empty"}), 400
 
     api_key = os.environ.get("GOOGLE_TRANSLATE_KEY")
     if not api_key:
-        return jsonify({"error": "Translation not configured"}), 500
+        return jsonify({"error": "Translation not configured (set GOOGLE_TRANSLATE_KEY)"}), 500
 
     try:
         params = {"q": text, "target": target, "key": api_key}
@@ -1983,15 +2005,41 @@ def translate_text():
         resp = requests.post(
             "https://translation.googleapis.com/language/translate/v2",
             params=params,
-            timeout=15
+            timeout=60
         )
         result = resp.json()
-        if "data" in result and "translations" in result["data"]:
-            t = result["data"]["translations"][0]
-            return jsonify({"translated": t["translatedText"], "detected_source": t.get("detectedSourceLanguage")})
-        return jsonify({"error": result.get("error", {}).get("message", "Translation failed")}), 500
+        if "data" not in result or "translations" not in result["data"]:
+            return jsonify({"error": result.get("error", {}).get("message", "Translation failed")}), 500
+        t = result["data"]["translations"][0]
+        translated = t["translatedText"]
+        detected_source = t.get("detectedSourceLanguage")
+
+        # Save translated text to Mega ocr-translated folder
+        mega_link = None
+        try:
+            translated_filename = base_filename.rsplit('.', 1)[0] + f"_{target}.txt"
+            import tempfile as _tf
+            tmp = _tf.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
+            tmp.write(translated)
+            tmp.close()
+            m = _get_mega_client()
+            if m:
+                folder_handle = ensure_mega_folder(m, "ocr-translated")
+                if folder_handle:
+                    mega_call(m, "upload", tmp.name, dest=folder_handle, dest_filename=translated_filename, timeout=120)
+                    uploaded_node = mega_call(m, "find", f"ocr-translated/{translated_filename}")
+                    if uploaded_node:
+                        mega_link = mega_call(m, "get_link", uploaded_node[0], timeout=30)
+            os.unlink(tmp.name)
+        except Exception as e:
+            logger.error(f"Failed to upload translated file to Mega for {task_id}: {e}")
+
+        resp_data = {"translated": translated, "detected_source": detected_source}
+        if mega_link:
+            resp_data["mega_link"] = mega_link
+        return jsonify(resp_data)
     except requests.exceptions.Timeout:
-        return jsonify({"error": "Translation timed out"}), 500
+        return jsonify({"error": "Translation timed out - text may be too large"}), 500
     except Exception:
         return jsonify({"error": "Translation failed"}), 500
 

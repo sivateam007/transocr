@@ -23,10 +23,19 @@ import requests
 import gc
 
 # Ensure pytesseract can find the tesseract binary installed via build.sh
-for _tess in ['/usr/bin/tesseract', '/usr/local/bin/tesseract']:
-    if os.path.isfile(_tess):
-        pytesseract.pytesseract.tesseract_cmd = _tess
-        break
+import shutil
+_tess_path = shutil.which('tesseract')
+if _tess_path:
+    pytesseract.pytesseract.tesseract_cmd = _tess_path
+    logger.info(f"Found tesseract at: {_tess_path}")
+else:
+    for _tess in ['/usr/bin/tesseract', '/usr/local/bin/tesseract', '/usr/bin/tesseract-ocr']:
+        if os.path.isfile(_tess):
+            pytesseract.pytesseract.tesseract_cmd = _tess
+            logger.info(f"Found tesseract at (fallback): {_tess}")
+            break
+    else:
+        logger.warning("tesseract not found via shutil.which or common paths")
 try:
     from deep_translator import GoogleTranslator
     _DEEP_TRANSLATOR_AVAILABLE = True

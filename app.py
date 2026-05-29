@@ -1337,9 +1337,9 @@ def init_mega():
     password = os.environ.get("MEGA_PWD")
     if not email or not password:
         return None
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TimeoutError
     try:
         from mega import Mega
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TimeoutError
         mega = Mega()
         ex = ThreadPoolExecutor(max_workers=1)
         try:

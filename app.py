@@ -22,12 +22,11 @@ from PIL import Image
 import requests
 import gc
 try:
-    import argostranslate.package
-    import argostranslate.translate
-    _ARGOS_AVAILABLE = True
+    from deep_translator import GoogleTranslator
+    _DEEP_TRANSLATOR_AVAILABLE = True
 except ImportError:
-    _ARGOS_AVAILABLE = False
-    logger.warning("argostranslate not installed; translation will be unavailable")
+    _DEEP_TRANSLATOR_AVAILABLE = False
+    logger.warning("deep-translator not installed; translation will be unavailable")
 
 # Tell mega.py to use pycryptodome instead of the broken pycrypto
 os.environ['MEGA_USE_CRYPTO_DOME'] = '1'
@@ -230,16 +229,16 @@ def _get_mega_client():
 
 
 def _translate_text(text, target_lang, source_lang='en'):
-    """Translate text using Argos Translate (offline, free, no API key). Returns translated string or None."""
+    """Translate text using Google Translate (via deep-translator, free, no API key). Returns translated string or None."""
     if not text or not text.strip() or not target_lang:
         return None
-    if not _ensure_argos_package(source_lang, target_lang):
+    if not _DEEP_TRANSLATOR_AVAILABLE:
         return None
     try:
-        translated = argostranslate.translate.translate(text, source_lang, target_lang)
-        return translated
+        t = _get_translator(source_lang, target_lang)
+        return t.translate(text)
     except Exception:
-        logger.warning(f"Argos translation {source_lang}->{target_lang} failed", exc_info=True)
+        logger.warning(f"Translation {source_lang}->{target_lang} failed", exc_info=True)
         return None
 
 
@@ -342,48 +341,15 @@ TESSERACT_TO_ISO = {
     "ell": "el", "heb": "he",
 }
 
-# Cache installed Argos Translate packages to avoid re-downloading
-_installed_argos_packages = set()
-_argos_index_updated = False
+# Cache translator instance to avoid re-initializing
+_translator_cache = {}
 
-def _ensure_argos_package(from_code, to_code):
-    """Ensure Argos Translate language package is installed (pre-downloaded in build, or download lazily)."""
-    if not _ARGOS_AVAILABLE:
-        return False
-    global _argos_index_updated
-    key = f"{from_code}-{to_code}"
-    if key in _installed_argos_packages:
-        return True
-    # Try direct translation first (works if pre-installed in build.sh)
-    try:
-        result = argostranslate.translate.translate("test", from_code, to_code)
-        if result:
-            _installed_argos_packages.add(key)
-            return True
-    except Exception:
-        pass
-    # Not installed — download and install
-    if not _argos_index_updated:
-        try:
-            argostranslate.package.update_package_index()
-            _argos_index_updated = True
-        except Exception as e:
-            logger.warning(f"Failed to update Argos package index: {e}")
-            return False
-    try:
-        available = argostranslate.package.get_available_packages()
-        pkg = next((p for p in available if p.from_code == from_code and p.to_code == to_code), None)
-        if not pkg:
-            logger.warning(f"No Argos package for {from_code}->{to_code}")
-            return False
-        install_path = pkg.download()
-        argostranslate.package.install_from_path(install_path)
-        _installed_argos_packages.add(key)
-        logger.info(f"Installed Argos package: {from_code}->{to_code}")
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to install Argos package {from_code}->{to_code}: {e}")
-        return False
+def _get_translator(source, target):
+    """Get or create a cached GoogleTranslator instance."""
+    key = f"{source}-{target}"
+    if key not in _translator_cache:
+        _translator_cache[key] = GoogleTranslator(source=source, target=target)
+    return _translator_cache[key]
 
 def get_file_type(filename):
     """Determine file type and processing method"""
@@ -2132,8 +2098,8 @@ def translate_text():
     if not task_id:
         return jsonify({"error": "task_id required"}), 400
 
-    if not _ARGOS_AVAILABLE:
-        return jsonify({"error": "Translation library (argostranslate) not installed"}), 500
+    if not _DEEP_TRANSLATOR_AVAILABLE:
+        return jsonify({"error": "Translation library (deep-translator) not installed"}), 500
 
     # Read the full output file
     with progress_lock:
@@ -2154,11 +2120,9 @@ def translate_text():
     if not text.strip():
         return jsonify({"error": "Output file is empty"}), 400
 
-    if not _ensure_argos_package(source, target):
-        return jsonify({"error": f"No Argos translation model for {source}->{target}"}), 400
-
     try:
-        translated = argostranslate.translate.translate(text, source, target)
+        t = _get_translator(source, target)
+        translated = t.translate(text)
     except Exception:
         return jsonify({"error": "Translation failed - text may be too large"}), 500
 

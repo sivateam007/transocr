@@ -2315,7 +2315,7 @@ def health():
 def debug():
     import subprocess as _sp
     out = {}
-    for cmd in [['which', 'tesseract'], ['tesseract', '--version'], ['apt-get', '--version']]:
+    for cmd in [['which', 'tesseract'], ['tesseract', '--version'], ['apt-get', '--version'], ['dpkg', '-l', 'tesseract-ocr'], ['ls', '-la', '/usr/bin/tesseract*']]:
         try:
             r = _sp.run(cmd, capture_output=True, timeout=10)
             out[' '.join(cmd)] = {'rc': r.returncode, 'stdout': r.stdout.decode(errors='replace')[:500], 'stderr': r.stderr.decode(errors='replace')[:500]}
@@ -2324,8 +2324,7 @@ def debug():
     out['tesseract_cmd'] = pytesseract.pytesseract.tesseract_cmd
     out['shutil_which'] = shutil.which('tesseract')
     out['isfile_usr'] = os.path.isfile('/usr/bin/tesseract')
-    avail = os.path.exists('/usr/lib/x86_64-linux-gnu/tesseract-ocr') or os.path.exists('/usr/share/tesseract-ocr')
-    out['tessdata_avail'] = avail
+    out['whoami'] = _sp.run(['whoami'], capture_output=True, timeout=5).stdout.decode().strip()
     return out, 200
 
 @app.errorhandler(413)

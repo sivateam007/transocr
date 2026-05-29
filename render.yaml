@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: transocr
+    runtime: python
+    buildCommand: bash build.sh
+    startCommand: gunicorn app:app
+    envVars:
+      - key: MEGA_EMAIL
+        sync: false
+      - key: MEGA_PWD
+        sync: false

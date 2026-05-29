@@ -21,6 +21,9 @@ from pytesseract import image_to_osd
 from PIL import Image
 import requests
 import gc
+
+# Tell mega.py to use pycryptodome instead of the broken pycrypto
+os.environ['MEGA_USE_CRYPTO_DOME'] = '1'
 gc.set_threshold(100, 5, 2)  # More aggressive GC for memory-constrained environments
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _CTimeoutError

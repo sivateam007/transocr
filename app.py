@@ -222,71 +222,61 @@ def _get_mega_client():
     return _mega_client
 
 
-def _auto_translate_and_upload(task_id):
-    """
-    After OCR completes, auto-translate the result and upload to Mega ocr-translated/.
-    Returns translated Mega link or None.
-    """
-    with progress_lock:
-        task = progress_tracker.get(task_id)
-        if not task:
-            return None
-        target_lang = task.get("translate_to")
-        output_path = task.get("output_path")
-        base_filename = task.get("output_filename", "output.txt")
-    if not target_lang or not output_path or not os.path.exists(output_path):
-        return None
-    try:
-        with open(output_path, 'r', encoding='utf-8', errors='replace') as f:
-            text = f.read()
-    except Exception:
-        logger.error(f"Task {task_id}: Failed to read output for translation")
-        return None
-    if not text.strip():
-        return None
+def _translate_text(text, target_lang):
+    """Translate text using Microsoft Translator free tier API. Returns translated string or None."""
     api_key = os.environ.get("AZURE_TRANSLATE_KEY")
-    if not api_key:
-        logger.warning("Task {task_id}: AZURE_TRANSLATE_KEY not set, skipping auto-translate")
+    if not api_key or not text or not target_lang:
         return None
     try:
         resp = requests.post(
-            "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=" + target_lang,
+            f"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to={target_lang}",
             json=[{"Text": text}],
-            timeout=120,
+            timeout=60,
             headers={
                 "Ocp-Apim-Subscription-Key": api_key,
                 "Content-Type": "application/json"
             }
         )
         if resp.status_code != 200:
-            logger.error(f"Task {task_id}: Microsoft Translator returned {resp.status_code}: {resp.text}")
             return None
         result = resp.json()
-        if not result or not isinstance(result, list) or not result[0].get("translations"):
-            logger.error(f"Task {task_id}: Microsoft Translator bad response: {result}")
+        if result and isinstance(result, list) and result[0].get("translations"):
+            return result[0]["translations"][0]["text"]
+    except Exception:
+        pass
+    return None
+
+
+def _auto_translate_and_upload(task_id):
+    """
+    Upload pre-built translated output file to Mega ocr-translated/ folder.
+    The translation is done page-by-page during OCR processing.
+    Returns Mega download link or None.
+    """
+    with progress_lock:
+        task = progress_tracker.get(task_id)
+        if not task:
             return None
-        translated = result[0]["translations"][0]["text"]
-        if not translated:
-            return None
-        import tempfile as _tf
+        target_lang = task.get("translate_to")
+        translated_path = task.get("translated_output_path")
+        base_filename = task.get("output_filename", "output.txt")
+    if not target_lang or not translated_path or not os.path.exists(translated_path):
+        return None
+    try:
         translated_filename = base_filename.rsplit('.', 1)[0] + f"_{target_lang}.txt"
-        tmp = _tf.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
-        tmp.write(translated)
-        tmp.close()
         mega_link = None
         m = _get_mega_client()
         if m:
             folder_handle = ensure_mega_folder(m, "ocr-translated")
             if folder_handle:
-                mega_call(m, "upload", tmp.name, dest=folder_handle, dest_filename=translated_filename, timeout=120)
+                mega_call(m, "upload", translated_path, dest=folder_handle, dest_filename=translated_filename, timeout=120)
                 uploaded_node = mega_call(m, "find", f"ocr-translated/{translated_filename}")
                 if uploaded_node:
                     mega_link = mega_call(m, "get_link", uploaded_node[0], timeout=30)
                     logger.info(f"Task {task_id}: Translated file uploaded to Mega: {mega_link}")
-        os.unlink(tmp.name)
         return mega_link
     except Exception as e:
-        logger.error(f"Task {task_id}: Auto-translate failed: {e}")
+        logger.error(f"Task {task_id}: Auto-translate upload failed: {e}")
         return None
 
 
@@ -468,12 +458,13 @@ def _ocr_page(img, lang, timeout, task_id, page):
         pool.shutdown(wait=False)
 
 
-def process_pdf_ocr(pdf_path, lang=DEFAULT_LANG, dpi=200, task_id=None, output_file=None, start_page=None, end_page=None):
+def process_pdf_ocr(pdf_path, lang=DEFAULT_LANG, dpi=200, task_id=None, output_file=None, start_page=None, end_page=None, translated_output_file=None, translate_to=None):
     """
     Process PDF pages in batches using OCR, write directly to file for memory efficiency.
     Updates progress_tracker if task_id is provided.
     Processes pages from start_page to end_page (inclusive) in batches of BATCH_SIZE.
     If end_page is None, processes only start_page (single page mode).
+    If translated_output_file and translate_to are set, translates each page after OCR.
     Returns number of pages processed.
     """
     page_num = start_page if start_page else 1
@@ -561,6 +552,11 @@ def process_pdf_ocr(pdf_path, lang=DEFAULT_LANG, dpi=200, task_id=None, output_f
                     if output_file:
                         output_file.write(f"--- Page {page} ---\n{text}\n\n")
                         output_file.flush()
+                    if translated_output_file and translate_to and not text.startswith("[OCR failed"):
+                        translated_text = _translate_text(text, translate_to)
+                        if translated_text:
+                            translated_output_file.write(f"--- Page {page} ---\n{translated_text}\n\n")
+                            translated_output_file.flush()
                     pages_processed += 1
                     if task_id:
                         with progress_lock:
@@ -613,6 +609,11 @@ def process_pdf_ocr(pdf_path, lang=DEFAULT_LANG, dpi=200, task_id=None, output_f
             if output_file:
                 output_file.write(f"--- Page {page} ---\n{text}\n\n")
                 output_file.flush()
+            if translated_output_file and translate_to:
+                translated_text = _translate_text(text, translate_to)
+                if translated_text:
+                    translated_output_file.write(f"--- Page {page} ---\n{translated_text}\n\n")
+                    translated_output_file.flush()
             pages_processed += 1
             if task_id:
                     with progress_lock:
@@ -794,6 +795,14 @@ def process_file_background(task_id, file_path, filename, temp_dir, selected_lan
         with progress_lock:
             progress_tracker[task_id]["output_path"] = output_path
             progress_tracker[task_id]["output_filename"] = output_filename
+            translate_to = progress_tracker[task_id].get("translate_to")
+        
+        # Create translated output file path if translate_to is set
+        translated_output_path = None
+        if translate_to:
+            translated_output_path = os.path.join(temp_dir, f"{os.path.splitext(filename)[0]}_{translate_to}.txt")
+            with progress_lock:
+                progress_tracker[task_id]["translated_output_path"] = translated_output_path
         
         # Process based on file type
         if file_type == 'pdf':
@@ -855,92 +864,101 @@ def process_file_background(task_id, file_path, filename, temp_dir, selected_lan
             last_checkpoint_pages = 0
             
             with open(output_path, 'w', encoding='utf-8') as output_file:
+                t_out = None
+                if translated_output_path:
+                    t_out = open(translated_output_path, 'w', encoding='utf-8')
                 current = actual_start
-                while actual_end is None or current <= actual_end:
-                    if total_pages and current > total_pages:
-                        break
-                    
-                    # Check for cancel
-                    cancelled_flag = False
-                    if task_id:
-                        with progress_lock:
-                            if progress_tracker[task_id].get("cancelled"):
-                                logger.info(f"Task {task_id}: Cancelled by user")
-                                progress_tracker[task_id]["status"] = "cancelled"
-                                progress_tracker[task_id]["error"] = "Cancelled by user"
-                                cancelled_flag = True
-                    if cancelled_flag:
-                        _save_progress(True)
-                        return
-                    
-                    batch_end = min(current + BATCH_SIZE - 1, actual_end) if actual_end else current + BATCH_SIZE - 1
-                    
-                    # Process batch of pages
-                    result = process_pdf_ocr(
-                        file_path,
-                        lang=detected_lang,
-                        dpi=dpi,
-                        task_id=task_id,
-                        output_file=output_file,
-                        start_page=current,
-                        end_page=batch_end
-                    )
-                    if result == 0:
-                        break
-                    
-                    pages_processed += result
-                    current = batch_end + 1
-                    
-                    # Log page progress every 10 pages
-                    if pages_processed % 10 == 0:
-                        logger.info(f"Task {task_id}: Processed {pages_processed} pages so far")
-                        _ocr_keepalive_ping()
-                    
-                    # Save progress every page for crash recovery (throttled to max 1 write/2s)
-                    _save_progress()
-                    
-                    # Upload checkpoint to Mega every CHECKPOINT_INTERVAL pages
-                    if pages_processed - last_checkpoint_pages >= CHECKPOINT_INTERVAL:
-                        last_checkpoint_pages = pages_processed
-                        # Lazy Mega login (only when first checkpoint is due)
-                        if mega_ckpt is None and os.environ.get("MEGA_EMAIL") and os.environ.get("MEGA_PWD"):
-                            mega_ckpt = init_mega()
+                try:
+                    while actual_end is None or current <= actual_end:
+                        if total_pages and current > total_pages:
+                            break
+                        
+                        # Check for cancel
+                        cancelled_flag = False
+                        if task_id:
+                            with progress_lock:
+                                if progress_tracker[task_id].get("cancelled"):
+                                    logger.info(f"Task {task_id}: Cancelled by user")
+                                    progress_tracker[task_id]["status"] = "cancelled"
+                                    progress_tracker[task_id]["error"] = "Cancelled by user"
+                                    cancelled_flag = True
+                        if cancelled_flag:
+                            _save_progress(True)
+                            return
+                        
+                        batch_end = min(current + BATCH_SIZE - 1, actual_end) if actual_end else current + BATCH_SIZE - 1
+                        
+                        # Process batch of pages
+                        result = process_pdf_ocr(
+                            file_path,
+                            lang=detected_lang,
+                            dpi=dpi,
+                            task_id=task_id,
+                            output_file=output_file,
+                            start_page=current,
+                            end_page=batch_end,
+                            translated_output_file=t_out,
+                            translate_to=translate_to
+                        )
+                        if result == 0:
+                            break
+                        
+                        pages_processed += result
+                        current = batch_end + 1
+                        
+                        # Log page progress every 10 pages
+                        if pages_processed % 10 == 0:
+                            logger.info(f"Task {task_id}: Processed {pages_processed} pages so far")
+                            _ocr_keepalive_ping()
+                        
+                        # Save progress every page for crash recovery (throttled to max 1 write/2s)
+                        _save_progress()
+                        
+                        # Upload checkpoint to Mega every CHECKPOINT_INTERVAL pages
+                        if pages_processed - last_checkpoint_pages >= CHECKPOINT_INTERVAL:
+                            last_checkpoint_pages = pages_processed
+                            # Lazy Mega login (only when first checkpoint is due)
+                            if mega_ckpt is None and os.environ.get("MEGA_EMAIL") and os.environ.get("MEGA_PWD"):
+                                mega_ckpt = init_mega()
 
-                        if mega_ckpt:
-                            # Upload original file on first checkpoint only (best-effort)
-                            if not originals_uploaded:
+                            if mega_ckpt:
+                                # Upload original file on first checkpoint only (best-effort)
+                                if not originals_uploaded:
+                                    try:
+                                        originals_handle = ensure_mega_folder(mega_ckpt, "ocr-originals")
+                                        if originals_handle:
+                                            res = mega_call(mega_ckpt, "upload", file_path, dest=originals_handle, dest_filename=filename, timeout=120)
+                                            with progress_lock:
+                                                progress_tracker[task_id]["mega_original_handle"] = str(getattr(res, 'node_id', res))
+                                            originals_uploaded = True
+                                            logger.info(f"Task {task_id}: Original uploaded to Mega for resume")
+                                    except Exception as e:
+                                        logger.warning(f"Task {task_id}: Original upload failed (checkpoint still saved): {e}")
+
+                                checkpoint_data = {
+                                    "task_id": task_id,
+                                    "last_page": current - 1,
+                                    "total_pages": total_pages,
+                                    "filename": filename,
+                                    "output_filename": output_filename,
+                                    "detected_lang": detected_lang,
+                                    "file_type": "pdf",
+                                    "start_page": actual_start,
+                                    "end_page": actual_end,
+                                    "created_at": time.time(),
+                                    "original_filename": filename
+                                }
                                 try:
-                                    originals_handle = ensure_mega_folder(mega_ckpt, "ocr-originals")
-                                    if originals_handle:
-                                        result = mega_call(mega_ckpt, "upload", file_path, dest=originals_handle, dest_filename=filename, timeout=120)
-                                        with progress_lock:
-                                            progress_tracker[task_id]["mega_original_handle"] = str(getattr(result, 'node_id', result))
-                                        originals_uploaded = True
-                                        logger.info(f"Task {task_id}: Original uploaded to Mega for resume")
+                                    upload_checkpoint(mega_ckpt, task_id, output_path, checkpoint_data)
+                                    logger.info(f"Task {task_id}: Checkpoint saved at page {current - 1}")
+                                    with progress_lock:
+                                        progress_tracker[task_id]["last_checkpoint_page"] = current - 1
+                                    _save_progress()
                                 except Exception as e:
-                                    logger.warning(f"Task {task_id}: Original upload failed (checkpoint still saved): {e}")
-
-                            checkpoint_data = {
-                                "task_id": task_id,
-                                "last_page": current - 1,
-                                "total_pages": total_pages,
-                                "filename": filename,
-                                "output_filename": output_filename,
-                                "detected_lang": detected_lang,
-                                "file_type": "pdf",
-                                "start_page": actual_start,
-                                "end_page": actual_end,
-                                "created_at": time.time(),
-                                "original_filename": filename
-                            }
-                            try:
-                                upload_checkpoint(mega_ckpt, task_id, output_path, checkpoint_data)
-                                logger.info(f"Task {task_id}: Checkpoint saved at page {current - 1}")
-                                with progress_lock:
-                                    progress_tracker[task_id]["last_checkpoint_page"] = current - 1
-                                _save_progress()
-                            except Exception as e:
-                                logger.warning(f"Task {task_id}: Checkpoint upload failed: {e}")
+                                    logger.warning(f"Task {task_id}: Checkpoint upload failed: {e}")
+                finally:
+                    if t_out:
+                        t_out.close()
             
             logger.info(f"Task {task_id}: OCR returned {pages_processed} pages")
             

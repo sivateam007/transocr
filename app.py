@@ -21,6 +21,12 @@ from pytesseract import image_to_osd
 from PIL import Image
 import requests
 import gc
+
+# Ensure pytesseract can find the tesseract binary installed via build.sh
+for _tess in ['/usr/bin/tesseract', '/usr/local/bin/tesseract']:
+    if os.path.isfile(_tess):
+        pytesseract.pytesseract.tesseract_cmd = _tess
+        break
 try:
     from deep_translator import GoogleTranslator
     _DEEP_TRANSLATOR_AVAILABLE = True

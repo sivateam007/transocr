@@ -23,32 +23,33 @@ from PIL import Image
 import requests
 import gc
 
-# Ensure pytesseract can find the tesseract binary installed via build.sh
-import subprocess
-_tess_path = shutil.which('tesseract')
-if _tess_path:
-    pytesseract.pytesseract.tesseract_cmd = _tess_path
-    print(f"Found tesseract at: {_tess_path}")
-elif os.path.isfile('/usr/bin/tesseract'):
-    pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
-    print("Found tesseract at: /usr/bin/tesseract")
-else:
-    print("tesseract not found; attempting install...")
-    _install_ok = False
-    for _cmd in [['apt-get', 'install', '-y', '-qq', 'tesseract-ocr', 'tesseract-ocr-eng'],
-                 ['sudo', 'apt-get', 'install', '-y', '-qq', 'tesseract-ocr', 'tesseract-ocr-eng']]:
-        try:
-            subprocess.run(_cmd, capture_output=True, timeout=120, check=False)
-            if shutil.which('tesseract') or os.path.isfile('/usr/bin/tesseract'):
-                _install_ok = True
-                break
-        except Exception:
-            continue
-    if _install_ok:
+# Ensure pytesseract can find the tesseract binary
+import subprocess as _sp
+def _ensure_tesseract():
+    t = shutil.which('tesseract')
+    if t:
+        pytesseract.pytesseract.tesseract_cmd = t
+        print(f"tesseract found at: {t}")
+        return
+    if os.path.isfile('/usr/bin/tesseract'):
         pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
-        print("tesseract installed at runtime")
+        print("tesseract found at: /usr/bin/tesseract")
+        return
+    print("tesseract not found; installing via apt-get...")
+    for cmd in [['apt-get', 'update', '-qq'], ['apt-get', 'install', '-y', '-qq', 'tesseract-ocr', 'tesseract-ocr-eng']]:
+        try:
+            r = _sp.run(cmd, capture_output=True, timeout=120)
+            if r.returncode != 0:
+                print(f"  {' '.join(cmd)} failed: {r.stderr.decode(errors='replace')[:200]}")
+        except Exception as e:
+            print(f"  {' '.join(cmd)} error: {e}")
+    t = shutil.which('tesseract')
+    if t:
+        pytesseract.pytesseract.tesseract_cmd = t
+        print(f"tesseract installed at: {t}")
     else:
-        print("tesseract runtime install failed; deep-translator still available for later use")
+        print("tesseract install failed")
+_ensure_tesseract()
 try:
     from deep_translator import GoogleTranslator
     _DEEP_TRANSLATOR_AVAILABLE = True

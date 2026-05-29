@@ -347,13 +347,22 @@ _installed_argos_packages = set()
 _argos_index_updated = False
 
 def _ensure_argos_package(from_code, to_code):
-    """Download and install Argos Translate language package lazily."""
+    """Ensure Argos Translate language package is installed (pre-downloaded in build, or download lazily)."""
     if not _ARGOS_AVAILABLE:
         return False
     global _argos_index_updated
     key = f"{from_code}-{to_code}"
     if key in _installed_argos_packages:
         return True
+    # Try direct translation first (works if pre-installed in build.sh)
+    try:
+        result = argostranslate.translate.translate("test", from_code, to_code)
+        if result:
+            _installed_argos_packages.add(key)
+            return True
+    except Exception:
+        pass
+    # Not installed — download and install
     if not _argos_index_updated:
         try:
             argostranslate.package.update_package_index()

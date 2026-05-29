@@ -24,16 +24,16 @@ import requests
 import gc
 
 # Ensure pytesseract can find the tesseract binary installed via build.sh
-import subprocess, shutil
+import subprocess
 _tess_path = shutil.which('tesseract')
 if _tess_path:
     pytesseract.pytesseract.tesseract_cmd = _tess_path
-    logger.info(f"Found tesseract at: {_tess_path}")
+    print(f"Found tesseract at: {_tess_path}")
 elif os.path.isfile('/usr/bin/tesseract'):
     pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
-    logger.info("Found tesseract at: /usr/bin/tesseract")
+    print("Found tesseract at: /usr/bin/tesseract")
 else:
-    logger.warning("tesseract not found; attempting install...")
+    print("tesseract not found; attempting install...")
     _install_ok = False
     for _cmd in [['apt-get', 'install', '-y', '-qq', 'tesseract-ocr', 'tesseract-ocr-eng'],
                  ['sudo', 'apt-get', 'install', '-y', '-qq', 'tesseract-ocr', 'tesseract-ocr-eng']]:
@@ -46,30 +46,14 @@ else:
             continue
     if _install_ok:
         pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
-        logger.info("tesseract installed at runtime")
+        print("tesseract installed at runtime")
     else:
-        # Last resort: download static binary
-        _tess_url = "https://github.com/tesseract-ocr/tesseract/releases/download/5.3.3/tesseract-5.3.3-linux-amd64.tar.gz"
-        _tess_dest = "/tmp/tesseract.tar.gz"
-        try:
-            r = requests.get(_tess_url, timeout=30)
-            if r.status_code == 200:
-                with open(_tess_dest, 'wb') as _f: _f.write(r.content)
-                import tarfile
-                with tarfile.open(_tess_dest, 'r:gz') as _tf:
-                    _tf.extractall('/tmp/tesseract-static/')
-                _static_tess = shutil.which('tesseract', path='/tmp/tesseract-static')
-                if _static_tess:
-                    pytesseract.pytesseract.tesseract_cmd = _static_tess
-                    logger.info(f"tesseract from static binary at: {_static_tess}")
-        except Exception:
-            logger.error("All tesseract installation attempts failed")
+        print("tesseract runtime install failed; deep-translator still available for later use")
 try:
     from deep_translator import GoogleTranslator
     _DEEP_TRANSLATOR_AVAILABLE = True
 except ImportError:
     _DEEP_TRANSLATOR_AVAILABLE = False
-    logger.warning("deep-translator not installed; translation will be unavailable")
 
 # Tell mega.py to use pycryptodome instead of the broken pycrypto
 os.environ['MEGA_USE_CRYPTO_DOME'] = '1'

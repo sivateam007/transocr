@@ -221,6 +221,68 @@ def _get_mega_client():
             _mega_client = None
     return _mega_client
 
+
+def _auto_translate_and_upload(task_id):
+    """
+    After OCR completes, auto-translate the result and upload to Mega ocr-translated/.
+    Returns translated Mega link or None.
+    """
+    with progress_lock:
+        task = progress_tracker.get(task_id)
+        if not task:
+            return None
+        target_lang = task.get("translate_to")
+        output_path = task.get("output_path")
+        base_filename = task.get("output_filename", "output.txt")
+    if not target_lang or not output_path or not os.path.exists(output_path):
+        return None
+    try:
+        with open(output_path, 'r', encoding='utf-8', errors='replace') as f:
+            text = f.read()
+    except Exception:
+        logger.error(f"Task {task_id}: Failed to read output for translation")
+        return None
+    if not text.strip():
+        return None
+    try:
+        body = {"q": text, "target": target_lang}
+        resp = requests.post(
+            "https://libretranslate.com/translate",
+            json=body, timeout=120,
+            headers={"Content-Type": "application/json"}
+        )
+        if resp.status_code != 200:
+            logger.error(f"Task {task_id}: LibreTranslate returned {resp.status_code}")
+            return None
+        result = resp.json()
+        if "error" in result:
+            logger.error(f"Task {task_id}: LibreTranslate error: {result['error']}")
+            return None
+        translated = result.get("translatedText")
+        if not translated:
+            return None
+        import tempfile as _tf
+        translated_filename = base_filename.rsplit('.', 1)[0] + f"_{target_lang}.txt"
+        tmp = _tf.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
+        tmp.write(translated)
+        tmp.close()
+        mega_link = None
+        m = _get_mega_client()
+        if m:
+            folder_handle = ensure_mega_folder(m, "ocr-translated")
+            if folder_handle:
+                mega_call(m, "upload", tmp.name, dest=folder_handle, dest_filename=translated_filename, timeout=120)
+                uploaded_node = mega_call(m, "find", f"ocr-translated/{translated_filename}")
+                if uploaded_node:
+                    mega_link = mega_call(m, "get_link", uploaded_node[0], timeout=30)
+                    logger.info(f"Task {task_id}: Translated file uploaded to Mega: {mega_link}")
+        os.unlink(tmp.name)
+        return mega_link
+    except Exception as e:
+        logger.error(f"Task {task_id}: Auto-translate failed: {e}")
+        return None
+
+
 # Secondary keepalive: each active OCR thread also pings itself
 _ocr_keepalive_running = threading.Event()
 
@@ -1086,6 +1148,12 @@ def process_file_background(task_id, file_path, filename, temp_dir, selected_lan
         # Persist output file to ocr-outputs folder
         persist_output(task_id)
 
+        # Auto-translate to target language if set
+        translated_link = _auto_translate_and_upload(task_id)
+        if translated_link:
+            with progress_lock:
+                progress_tracker[task_id]["translated_link"] = translated_link
+
         # Mark as completed (respect cancel flag)
         with progress_lock:
             if not progress_tracker[task_id].get("cancelled"):
@@ -1587,6 +1655,12 @@ def resume_ocr_processing(task_id, original_path, metadata, output_path, temp_di
 
         persist_output(task_id)
 
+        # Auto-translate to target language if set
+        translated_link = _auto_translate_and_upload(task_id)
+        if translated_link:
+            with progress_lock:
+                progress_tracker[task_id]["translated_link"] = translated_link
+
         with progress_lock:
             progress_tracker[task_id]["status"] = "completed"
             progress_tracker[task_id]["pages_processed"] = pages_processed
@@ -1689,6 +1763,10 @@ def index():
         selected_lang = request.form.get('language', 'auto')
         logger.info(f"Language selection: {selected_lang}")
         
+        # Get target translation language (auto-translate after OCR)
+        translate_to = request.form.get('translate_to', 'none')
+        logger.info(f"Translate to: {translate_to}")
+        
         # Get page range (only for PDF)
         page_range = request.form.get('page_range', 'all')
         start_page = 1
@@ -1742,7 +1820,8 @@ def index():
                 "end_page": end_page,
                 "created_at": time.time(),
                 "file_type": file_type,
-                "cancelled": False
+                "cancelled": False,
+                "translate_to": translate_to if translate_to != 'none' else None
             }
         _save_progress(True)
         
@@ -2083,6 +2162,7 @@ def retry_task(task_id):
         old_total = old.get("total_pages")
         mega_node = old.get("mega_original_handle")
         detected_lang = old.get("detected_language")
+        translate_to = old.get("translate_to")
 
     # Everything after here is outside the lock
 
@@ -2137,7 +2217,8 @@ def retry_task(task_id):
             "created_at": time.time(),
             "file_type": file_type,
             "cancelled": False,
-            "retry_of": task_id
+            "retry_of": task_id,
+            "translate_to": translate_to
         }
     _save_progress(True)
 
@@ -2244,6 +2325,8 @@ def downloads_page():
                 "completed_at": task.get("completed_at", 0),
                 "created_at": task.get("created_at", 0),
                 "download_count": task.get("download_count", 0),
+                "translated_link": task.get("translated_link", ""),
+                "translate_to": task.get("translate_to", ""),
                 "status": status,
                 "percentage": task.get("percentage", 0),
                 "eta": eta,

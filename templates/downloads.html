@@ -56,6 +56,7 @@
                             <th style="padding: 1rem; text-align: left;">ETA</th>
                             <th style="padding: 1rem; text-align: left;">Checkpoint</th>
                             <th style="padding: 1rem; text-align: left;">Status</th>
+                            <th style="padding: 1rem; text-align: left;">Translated</th>
                             <th style="padding: 1rem; text-align: left;">DL</th>
                             <th style="padding: 1rem; text-align: left;">Action</th>
                         </tr>
@@ -113,6 +114,17 @@
                                 <span style="color: #f59e0b;">Interrupted</span>
                                 {% else %}
                                 <span style="color: #666;">{{ d.status }}</span>
+                                {% endif %}
+                            </td>
+                            <td style="padding: 1rem; text-align: center;">
+                                {% if d.translated_link %}
+                                <a href="{{ d.translated_link }}" target="_blank" onclick="trackDownload('{{ d.task_id }}')" style="color:var(--git-color);font-weight:600;text-decoration:none;" title="{{ d.translate_to }}">
+                                    <i class="fas fa-language"></i> ✓
+                                </a>
+                                {% elif d.translate_to and d.status == 'completed' %}
+                                <span style="color:#999;font-size:12px;">Pending</span>
+                                {% else %}
+                                <span style="color:#ccc;">-</span>
                                 {% endif %}
                             </td>
                             <td style="padding: 1rem; text-align: center;">{{ d.download_count }}</td>

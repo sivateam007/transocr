@@ -5,6 +5,7 @@ Flask application for rendering PDF OCR via web interface
 """
 
 import os
+import sys
 import tempfile
 import threading
 import uuid
@@ -2308,17 +2309,21 @@ def retry_task(task_id):
 @app.route('/health')
 def health():
     """Health check endpoint for Render"""
+    result = {
+        'status': 'healthy',
+        'tesseract_cmd': pytesseract.pytesseract.tesseract_cmd,
+        'python_version': sys.version.split()[0],
+    }
     try:
         version = pytesseract.get_tesseract_version()
-        # Check if Tamil and English packs are available
         languages = pytesseract.get_languages()
-        return {
-            'status': 'healthy',
-            'tesseract_version': str(version),
-            'languages_available': languages
-        }, 200
+        result['tesseract_version'] = str(version)
+        result['languages_available'] = languages
+        return result, 200
     except Exception as e:
-        return {'status': 'unhealthy', 'error': str(e)}, 500
+        result['status'] = 'unhealthy'
+        result['error'] = str(e)
+        return result, 500
 
 
 @app.errorhandler(413)

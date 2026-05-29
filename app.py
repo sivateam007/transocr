@@ -21,6 +21,13 @@ from pytesseract import image_to_osd
 from PIL import Image
 import requests
 import gc
+try:
+    import argostranslate.package
+    import argostranslate.translate
+    _ARGOS_AVAILABLE = True
+except ImportError:
+    _ARGOS_AVAILABLE = False
+    logger.warning("argostranslate not installed; translation will be unavailable")
 
 # Tell mega.py to use pycryptodome instead of the broken pycrypto
 os.environ['MEGA_USE_CRYPTO_DOME'] = '1'
@@ -222,29 +229,18 @@ def _get_mega_client():
     return _mega_client
 
 
-def _translate_text(text, target_lang):
-    """Translate text using Microsoft Translator free tier API. Returns translated string or None."""
-    api_key = os.environ.get("AZURE_TRANSLATE_KEY")
-    if not api_key or not text or not target_lang:
+def _translate_text(text, target_lang, source_lang='en'):
+    """Translate text using Argos Translate (offline, free, no API key). Returns translated string or None."""
+    if not text or not text.strip() or not target_lang:
+        return None
+    if not _ensure_argos_package(source_lang, target_lang):
         return None
     try:
-        resp = requests.post(
-            f"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to={target_lang}",
-            json=[{"Text": text}],
-            timeout=60,
-            headers={
-                "Ocp-Apim-Subscription-Key": api_key,
-                "Content-Type": "application/json"
-            }
-        )
-        if resp.status_code != 200:
-            return None
-        result = resp.json()
-        if result and isinstance(result, list) and result[0].get("translations"):
-            return result[0]["translations"][0]["text"]
+        translated = argostranslate.translate.translate(text, source_lang, target_lang)
+        return translated
     except Exception:
-        pass
-    return None
+        logger.warning(f"Argos translation {source_lang}->{target_lang} failed", exc_info=True)
+        return None
 
 
 def _auto_translate_and_upload(task_id):
@@ -335,6 +331,50 @@ LANG_CODE_TO_NAME = {
     "deu": "German",
     "ita": "Italian",
 }
+
+# Tesseract language code to ISO 639-1 code mapping (for translation source detection)
+TESSERACT_TO_ISO = {
+    "tam": "ta", "eng": "en", "hin": "hi", "mal": "ml",
+    "tel": "te", "kan": "kn", "ben": "bn", "guj": "gu",
+    "pan": "pa", "mar": "mr", "ara": "ar", "spa": "es",
+    "fra": "fr", "deu": "de", "ita": "it", "rus": "ru",
+    "chi_sim": "zh", "jpn": "ja", "kor": "ko", "tha": "th",
+    "ell": "el", "heb": "he",
+}
+
+# Cache installed Argos Translate packages to avoid re-downloading
+_installed_argos_packages = set()
+_argos_index_updated = False
+
+def _ensure_argos_package(from_code, to_code):
+    """Download and install Argos Translate language package lazily."""
+    if not _ARGOS_AVAILABLE:
+        return False
+    global _argos_index_updated
+    key = f"{from_code}-{to_code}"
+    if key in _installed_argos_packages:
+        return True
+    if not _argos_index_updated:
+        try:
+            argostranslate.package.update_package_index()
+            _argos_index_updated = True
+        except Exception as e:
+            logger.warning(f"Failed to update Argos package index: {e}")
+            return False
+    try:
+        available = argostranslate.package.get_available_packages()
+        pkg = next((p for p in available if p.from_code == from_code and p.to_code == to_code), None)
+        if not pkg:
+            logger.warning(f"No Argos package for {from_code}->{to_code}")
+            return False
+        install_path = pkg.download()
+        argostranslate.package.install_from_path(install_path)
+        _installed_argos_packages.add(key)
+        logger.info(f"Installed Argos package: {from_code}->{to_code}")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to install Argos package {from_code}->{to_code}: {e}")
+        return False
 
 def get_file_type(filename):
     """Determine file type and processing method"""
@@ -471,6 +511,7 @@ def process_pdf_ocr(pdf_path, lang=DEFAULT_LANG, dpi=200, task_id=None, output_f
     actual_end = end_page if end_page else page_num
     pages_processed = 0
     batch_size = BATCH_SIZE
+    from_code = TESSERACT_TO_ISO.get(lang.split('+')[0] if '+' in lang else lang, 'en')
 
     current = page_num
     while current <= actual_end:
@@ -553,7 +594,7 @@ def process_pdf_ocr(pdf_path, lang=DEFAULT_LANG, dpi=200, task_id=None, output_f
                         output_file.write(f"--- Page {page} ---\n{text}\n\n")
                         output_file.flush()
                     if translated_output_file and translate_to and not text.startswith("[OCR failed"):
-                        translated_text = _translate_text(text, translate_to)
+                        translated_text = _translate_text(text, translate_to, source_lang=from_code)
                         if translated_text:
                             translated_output_file.write(f"--- Page {page} ---\n{translated_text}\n\n")
                             translated_output_file.flush()
@@ -610,7 +651,7 @@ def process_pdf_ocr(pdf_path, lang=DEFAULT_LANG, dpi=200, task_id=None, output_f
                 output_file.write(f"--- Page {page} ---\n{text}\n\n")
                 output_file.flush()
             if translated_output_file and translate_to:
-                translated_text = _translate_text(text, translate_to)
+                translated_text = _translate_text(text, translate_to, source_lang=from_code)
                 if translated_text:
                     translated_output_file.write(f"--- Page {page} ---\n{translated_text}\n\n")
                     translated_output_file.flush()
@@ -2071,16 +2112,19 @@ def preview_text(task_id):
 
 @app.route('/translate', methods=['POST'])
 def translate_text():
-    """Translate full OCR result using Microsoft Translator (free tier) and save to Mega ocr-translated folder."""
+    """Translate full OCR result using Argos Translate (offline, free) and save to Mega ocr-translated folder."""
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"error": "No data provided"}), 400
     target = data.get("target_lang", "en")
-    source = data.get("source_lang")
+    source = data.get("source_lang", "en")
     task_id = data.get("task_id")
 
     if not task_id:
         return jsonify({"error": "task_id required"}), 400
+
+    if not _ARGOS_AVAILABLE:
+        return jsonify({"error": "Translation library (argostranslate) not installed"}), 500
 
     # Read the full output file
     with progress_lock:
@@ -2101,60 +2145,41 @@ def translate_text():
     if not text.strip():
         return jsonify({"error": "Output file is empty"}), 400
 
-    api_key = os.environ.get("AZURE_TRANSLATE_KEY")
-    if not api_key:
-        return jsonify({"error": "Translation not configured (set AZURE_TRANSLATE_KEY)"}), 500
+    if not _ensure_argos_package(source, target):
+        return jsonify({"error": f"No Argos translation model for {source}->{target}"}), 400
 
     try:
-        url = "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=" + target
-        if source:
-            url += "&from=" + source
-        resp = requests.post(
-            url,
-            json=[{"Text": text}],
-            timeout=120,
-            headers={
-                "Ocp-Apim-Subscription-Key": api_key,
-                "Content-Type": "application/json"
-            }
-        )
-        if resp.status_code != 200:
-            return jsonify({"error": f"Translation API returned {resp.status_code}"}), resp.status_code
-        result = resp.json()
-        if not result or not isinstance(result, list) or not result[0].get("translations"):
-            return jsonify({"error": "Translation API bad response"}), 500
-        translated = result[0]["translations"][0]["text"]
-        if not translated:
-            return jsonify({"error": "Translation returned empty"}), 500
-
-        # Save translated text to Mega ocr-translated folder
-        mega_link = None
-        try:
-            translated_filename = base_filename.rsplit('.', 1)[0] + f"_{target}.txt"
-            import tempfile as _tf
-            tmp = _tf.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
-            tmp.write(translated)
-            tmp.close()
-            m = _get_mega_client()
-            if m:
-                folder_handle = ensure_mega_folder(m, "ocr-translated")
-                if folder_handle:
-                    mega_call(m, "upload", tmp.name, dest=folder_handle, dest_filename=translated_filename, timeout=120)
-                    uploaded_node = mega_call(m, "find", f"ocr-translated/{translated_filename}")
-                    if uploaded_node:
-                        mega_link = mega_call(m, "get_link", uploaded_node[0], timeout=30)
-            os.unlink(tmp.name)
-        except Exception as e:
-            logger.error(f"Failed to upload translated file to Mega for {task_id}: {e}")
-
-        resp_data = {"translated": translated}
-        if mega_link:
-            resp_data["mega_link"] = mega_link
-        return jsonify(resp_data)
-    except requests.exceptions.Timeout:
-        return jsonify({"error": "Translation timed out - text may be too large"}), 500
+        translated = argostranslate.translate.translate(text, source, target)
     except Exception:
-        return jsonify({"error": "Translation failed"}), 500
+        return jsonify({"error": "Translation failed - text may be too large"}), 500
+
+    if not translated:
+        return jsonify({"error": "Translation returned empty"}), 500
+
+    # Save translated text to Mega ocr-translated folder
+    mega_link = None
+    try:
+        translated_filename = base_filename.rsplit('.', 1)[0] + f"_{target}.txt"
+        import tempfile as _tf
+        tmp = _tf.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
+        tmp.write(translated)
+        tmp.close()
+        m = _get_mega_client()
+        if m:
+            folder_handle = ensure_mega_folder(m, "ocr-translated")
+            if folder_handle:
+                mega_call(m, "upload", tmp.name, dest=folder_handle, dest_filename=translated_filename, timeout=120)
+                uploaded_node = mega_call(m, "find", f"ocr-translated/{translated_filename}")
+                if uploaded_node:
+                    mega_link = mega_call(m, "get_link", uploaded_node[0], timeout=30)
+        os.unlink(tmp.name)
+    except Exception as e:
+        logger.error(f"Failed to upload translated file to Mega for {task_id}: {e}")
+
+    resp_data = {"translated": translated}
+    if mega_link:
+        resp_data["mega_link"] = mega_link
+    return jsonify(resp_data)
 
 
 @app.route('/cancel/<task_id>', methods=['POST'])

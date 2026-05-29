@@ -1200,17 +1200,14 @@ def rebuild_completed_from_mega():
                 if tid in progress_tracker:
                     continue
 
-            link = mega_call(m, "get_link", nid, timeout=15)
-            if not link:
-                continue
-
             orig_name = name[:-8].rstrip('_')  # Remove '_ocr.txt' + trailing underscore
             with progress_lock:
                 progress_tracker[tid] = {
                     "current_page": 0, "status": "completed",
                     "result_path": None, "error": None,
                     "filename": orig_name, "output_filename": name,
-                    "download_link": link,
+                    "download_link": None,
+                    "mega_node_id": nid,
                     "mega_uploaded": True, "mega_status": "uploaded",
                     "file_type": "pdf", "detected_language": "",
                     "pages_processed": 0, "percentage": 100,
@@ -1838,6 +1835,38 @@ def track_download(task_id):
             progress_tracker[task_id]["download_count"] = progress_tracker[task_id].get("download_count", 0) + 1
             return jsonify({"ok": True}), 200
     return jsonify({"ok": False}), 404
+
+
+@app.route('/mega-link/<task_id>', methods=['POST'])
+def get_mega_link(task_id):
+    """Generate and cache a Mega download link for a task on demand."""
+    with progress_lock:
+        task = progress_tracker.get(task_id)
+        if not task:
+            return jsonify({"error": "Not found"}), 404
+        if task.get("download_link"):
+            return jsonify({"link": task["download_link"]}), 200
+        nid = task.get("mega_node_id")
+        if not nid:
+            return jsonify({"error": "No Mega node"}), 404
+    try:
+        from mega import Mega
+        email = os.environ.get("MEGA_EMAIL")
+        password = os.environ.get("MEGA_PWD")
+        if not email or not password:
+            return jsonify({"error": "Mega not configured"}), 500
+        m = Mega().login(email, password)
+        link = mega_call(m, "get_link", nid, timeout=30)
+        if not link:
+            return jsonify({"error": "Failed to get link"}), 500
+        with progress_lock:
+            task = progress_tracker.get(task_id)
+            if task:
+                task["download_link"] = link
+        return jsonify({"link": link}), 200
+    except Exception as e:
+        logger.error(f"Failed to get Mega link for {task_id}: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/preview/<task_id>')

@@ -1209,6 +1209,7 @@ def rebuild_completed_from_mega():
                     "filename": orig_name, "output_filename": name,
                     "download_link": None,
                     "mega_node_id": nid,
+                    "mega_node_info": finfo,
                     "mega_uploaded": True, "mega_status": "uploaded",
                     "file_type": "pdf", "detected_language": "",
                     "pages_processed": 0, "percentage": 100,
@@ -1805,6 +1806,10 @@ def download_result(task_id):
             return redirect(url_for('index'))
 
         if not task["output_path"] or not os.path.exists(task["output_path"]):
+            if task.get("mega_node_info"):
+                with progress_lock:
+                    progress_tracker[task_id]["download_count"] = progress_tracker[task_id].get("download_count", 0) + 1
+                return redirect(url_for('get_mega_link', task_id=task_id))
             flash('Result file not found')
             return redirect(url_for('index'))
 
@@ -1819,11 +1824,6 @@ def download_result(task_id):
         # Track download count
         with progress_lock:
             progress_tracker[task_id]["download_count"] = progress_tracker[task_id].get("download_count", 0) + 1
-
-        # Cleanup after sending (optional, can keep for debugging)
-        # shutil.rmtree(task["temp_dir"], ignore_errors=True)
-        # with progress_lock:
-        #     del progress_tracker[task_id]
 
         return response
 
@@ -1847,8 +1847,9 @@ def get_mega_link(task_id):
             return jsonify({"error": "Not found"}), 404
         if task.get("download_link"):
             return jsonify({"link": task["download_link"]}), 200
+        node_info = task.get("mega_node_info")
         nid = task.get("mega_node_id")
-        if not nid:
+        if not node_info and not nid:
             return jsonify({"error": "No Mega node"}), 404
     try:
         from mega import Mega
@@ -1857,7 +1858,7 @@ def get_mega_link(task_id):
         if not email or not password:
             return jsonify({"error": "Mega not configured"}), 500
         m = Mega().login(email, password)
-        link = mega_call(m, "get_link", nid, timeout=30)
+        link = mega_call(m, "get_link", node_info if node_info else nid, timeout=30)
         if not link:
             return jsonify({"error": "Failed to get link"}), 500
         with progress_lock:
@@ -1878,14 +1879,33 @@ def preview_text(task_id):
         if not task or task.get("status") != "completed":
             return jsonify({"error": "Not available"}), 404
         output_path = task.get("output_path")
-    if not output_path or not os.path.exists(output_path):
-        return jsonify({"text": "File not found"})
-    try:
-        with open(output_path, 'r', encoding='utf-8', errors='replace') as f:
-            text = f.read(1000)
-        return jsonify({"text": text})
-    except Exception as e:
-        return jsonify({"text": f"Error reading file: {e}"})
+        node_info = task.get("mega_node_info")
+        mega_filename = task.get("output_filename")
+    if output_path and os.path.exists(output_path):
+        try:
+            with open(output_path, 'r', encoding='utf-8', errors='replace') as f:
+                text = f.read(1000)
+            return jsonify({"text": text})
+        except Exception as e:
+            return jsonify({"text": f"Error reading file: {e}"})
+    if node_info and mega_filename:
+        try:
+            import tempfile as _tf
+            from mega import Mega
+            email = os.environ.get("MEGA_EMAIL")
+            password = os.environ.get("MEGA_PWD")
+            if email and password:
+                m = Mega().login(email, password)
+                tmp = _tf.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
+                tmp.close()
+                mega_call(m, "download", node_info, dest_path=tmp.name, timeout=30)
+                with open(tmp.name, 'r', encoding='utf-8', errors='replace') as f:
+                    text = f.read(1000)
+                os.unlink(tmp.name)
+                return jsonify({"text": text})
+        except Exception as e:
+            logger.error(f"Preview Mega download failed for {task_id}: {e}")
+    return jsonify({"text": "File not found on local storage or cloud"})
 
 
 @app.route('/cancel/<task_id>', methods=['POST'])

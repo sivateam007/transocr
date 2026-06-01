@@ -1847,10 +1847,9 @@ def get_mega_link(task_id):
             return jsonify({"error": "Not found"}), 404
         if task.get("download_link"):
             return jsonify({"link": task["download_link"]}), 200
-        node_info = task.get("mega_node_info")
-        nid = task.get("mega_node_id")
-        if not node_info and not nid:
-            return jsonify({"error": "No Mega node"}), 404
+        output_filename = task.get("output_filename")
+        if not output_filename:
+            return jsonify({"error": "Output filename not known"}), 404
     try:
         from mega import Mega
         email = os.environ.get("MEGA_EMAIL")
@@ -1858,7 +1857,11 @@ def get_mega_link(task_id):
         if not email or not password:
             return jsonify({"error": "Mega not configured"}), 500
         m = Mega().login(email, password)
-        link = mega_call(m, "get_link", node_info if node_info else nid, timeout=30)
+        found = mega_call(m, "find", f"ocr-outputs/{output_filename}", timeout=30)
+        if not found:
+            return jsonify({"error": "File not found in Mega storage"}), 404
+        node = found[0] if isinstance(found, list) else found
+        link = mega_call(m, "get_link", node, timeout=30)
         if not link:
             return jsonify({"error": "Failed to get link"}), 500
         with progress_lock:

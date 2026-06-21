@@ -1966,6 +1966,26 @@ def translate_file_background(task_id, file_path, filename, temp_dir, source_lan
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(result_text)
 
+        _save_progress()
+
+        try:
+            mega_link = upload_to_mega(output_path, output_filename)
+            with progress_lock:
+                progress_tracker[task_id]["download_link"] = mega_link
+                if mega_link:
+                    progress_tracker[task_id]["mega_uploaded"] = True
+                    progress_tracker[task_id]["mega_status"] = "uploaded"
+                    logger.info(f"Task {task_id}: Mega upload success - {mega_link}")
+                else:
+                    progress_tracker[task_id]["mega_uploaded"] = False
+                    progress_tracker[task_id]["mega_status"] = "failed: upload_to_mega returned None"
+                    logger.warning(f"Task {task_id}: Mega upload returned None")
+        except Exception as mega_err:
+            logger.error(f"Task {task_id}: Mega upload error: {mega_err}")
+            with progress_lock:
+                progress_tracker[task_id]["mega_uploaded"] = False
+                progress_tracker[task_id]["mega_status"] = f"failed: {mega_err}"
+
         persist_output(task_id)
 
         with progress_lock:

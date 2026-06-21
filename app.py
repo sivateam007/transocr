@@ -1178,21 +1178,14 @@ def cleanup_old_tasks():
 
 def upload_to_mega(local_file_path, remote_filename):
     """Upload a file to Mega.nz ocr-outputs folder and return download link"""
-    email = os.environ.get("MEGA_EMAIL")
-    password = os.environ.get("MEGA_PWD")
-
-    if not email or not password:
-        logger.warning("MEGA_EMAIL/MEGA_PWD not set - skipping cloud upload")
-        return None
-
     if not os.path.exists(local_file_path):
         logger.error(f"File not found for upload: {local_file_path}")
         return None
 
-    from mega import Mega
-
-    mega = Mega()
-    m = mega.login(email, password)
+    m = init_mega()
+    if not m:
+        logger.warning("Mega login failed - skipping cloud upload")
+        return None
 
     try:
         folders = mega_call(m, "find", "ocr-outputs")

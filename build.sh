@@ -17,3 +17,6 @@ tesseract --version 2>&1 | head -3 || echo "tesseract command failed"
 
 # Install Python dependencies
 pip install -r requirements.txt
+
+# Install mega.py (cloud storage) without --no-deps to avoid pulling pycrypto conflict
+pip install mega.py==1.0.8 --no-deps

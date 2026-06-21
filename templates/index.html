@@ -8,7 +8,6 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-    <!-- Header -->
     <header>
         <div class="header-container">
             <div class="logo">
@@ -36,7 +35,6 @@
                 {% endif %}
             {% endwith %}
 
-            <!-- File Type Tabs -->
             <div class="upload-tabs" style="display: flex; gap: 1rem; margin-bottom: 2rem; justify-content: center;">
                 <button type="button" class="tab-btn active" id="pdf-tab" style="padding: 1rem 2rem; border: 2px solid var(--git-color); background: var(--git-color); color: white; border-radius: 10px; cursor: pointer; font-weight: 600; font-family: 'Segoe UI', sans-serif; transition: all 0.3s;">
                     <i class="fas fa-file-pdf"></i> PDF
@@ -50,9 +48,12 @@
                 <button type="button" class="tab-btn" id="data-tab" style="padding: 1rem 2rem; border: 2px solid #ddd; background: white; color: var(--dark); border-radius: 10px; cursor: pointer; font-weight: 600; font-family: 'Segoe UI', sans-serif; transition: all 0.3s;">
                     <i class="fas fa-file-excel"></i> Data Files
                 </button>
+                <button type="button" class="tab-btn" id="translate-tab" style="padding: 1rem 2rem; border: 2px solid #ddd; background: white; color: var(--dark); border-radius: 10px; cursor: pointer; font-weight: 600; font-family: 'Segoe UI', sans-serif; transition: all 0.3s;">
+                    <i class="fas fa-language"></i> Translate
+                </button>
             </div>
 
-            <form method="POST" enctype="multipart/form-data" class="upload-form" id="upload-form">
+            <form method="POST" enctype="multipart/form-data" class="upload-form" id="upload-form" action="/">
                 <div class="file-input-wrapper">
                     <input type="file" name="file" id="pdf-upload" accept=".pdf" required>
                     <label for="pdf-upload" class="upload-box" id="drop-zone">
@@ -62,7 +63,7 @@
                     </label>
                 </div>
 
-                <div class="options-grid">
+                <div class="options-grid" id="ocr-options">
                     <div class="option-group">
                         <label class="option-label">Language</label>
                         <select name="language" id="language-select" class="select-input">
@@ -108,17 +109,112 @@
                     </div>
                 </div>
 
+                <div class="options-grid" id="translate-options" style="display: none;">
+                    <input type="hidden" name="mode" value="translate">
+                    <div class="option-group">
+                        <label class="option-label">Source Language</label>
+                        <select name="source_language" id="source-language-select" class="select-input">
+                            <option value="auto">Auto-Detect</option>
+                            <option value="en">English</option>
+                            <option value="ta">Tamil</option>
+                            <option value="hi">Hindi</option>
+                            <option value="te">Telugu</option>
+                            <option value="bn">Bengali</option>
+                            <option value="kn">Kannada</option>
+                            <option value="ml">Malayalam</option>
+                            <option value="gu">Gujarati</option>
+                            <option value="pa">Punjabi</option>
+                            <option value="mr">Marathi</option>
+                            <option value="ar">Arabic</option>
+                            <option value="es">Spanish</option>
+                            <option value="fr">French</option>
+                            <option value="de">German</option>
+                            <option value="it">Italian</option>
+                            <option value="ru">Russian</option>
+                            <option value="zh-cn">Chinese (Simplified)</option>
+                            <option value="ja">Japanese</option>
+                            <option value="ko">Korean</option>
+                            <option value="pt">Portuguese</option>
+                            <option value="tr">Turkish</option>
+                            <option value="vi">Vietnamese</option>
+                        </select>
+                    </div>
+
+                    <div class="option-group">
+                        <label class="option-label">Target Language</label>
+                        <select name="target_language" id="target-language-select" class="select-input">
+                            <option value="en">English</option>
+                            <option value="ta">Tamil</option>
+                            <option value="hi">Hindi</option>
+                            <option value="te">Telugu</option>
+                            <option value="bn">Bengali</option>
+                            <option value="kn">Kannada</option>
+                            <option value="ml">Malayalam</option>
+                            <option value="gu">Gujarati</option>
+                            <option value="pa">Punjabi</option>
+                            <option value="mr">Marathi</option>
+                            <option value="ar">Arabic</option>
+                            <option value="es">Spanish</option>
+                            <option value="fr">French</option>
+                            <option value="de">German</option>
+                            <option value="it">Italian</option>
+                            <option value="ru">Russian</option>
+                            <option value="zh-cn">Chinese (Simplified)</option>
+                            <option value="ja">Japanese</option>
+                            <option value="ko">Korean</option>
+                            <option value="pt">Portuguese</option>
+                            <option value="tr">Turkish</option>
+                            <option value="vi">Vietnamese</option>
+                            <option value="id">Indonesian</option>
+                            <option value="ms">Malay</option>
+                            <option value="nl">Dutch</option>
+                            <option value="pl">Polish</option>
+                            <option value="sv">Swedish</option>
+                            <option value="da">Danish</option>
+                            <option value="fi">Finnish</option>
+                            <option value="cs">Czech</option>
+                            <option value="ro">Romanian</option>
+                            <option value="uk">Ukrainian</option>
+                            <option value="hu">Hungarian</option>
+                        </select>
+                    </div>
+
+                    <div class="option-group">
+                        <label class="option-label">Page Range</label>
+                        <select name="page_range" id="translate-page-range-select" class="select-input">
+                            <option value="all">All Pages</option>
+                            <option value="custom">Custom Range</option>
+                        </select>
+                    </div>
+
+                    <div class="option-group" id="translate-start-page-group" style="display: none;">
+                        <label class="option-label">Start Page</label>
+                        <input type="number" name="start_page" id="translate-start-page" class="page-input" min="1" value="1" placeholder="From">
+                    </div>
+
+                    <div class="option-group" id="translate-end-page-group" style="display: none;">
+                        <label class="option-label">End Page</label>
+                        <input type="number" name="end_page" id="translate-end-page" class="page-input" min="1" placeholder="To (empty = all)">
+                    </div>
+                </div>
+
                 <button type="submit" class="submit-btn" id="submit-btn">
                     <span id="btn-text">Extract Text</span>
                 </button>
             </form>
 
-            <div class="info-box">
+            <div class="info-box" id="ocr-info-box">
                 <h4><i class="fas fa-lightbulb"></i> Pro Tip:</h4>
                 <p>Select language manually to skip auto-detection delay. For PDF and Image files, OCR will be used. For other documents, text will be extracted directly.</p>
             </div>
 
-            <p class="language-note">Supports: PDF, Images (JPG, PNG, BMP, TIFF), Documents (DOCX, PPTX, RTF, ODT), Data (XLSX, CSV, XML, JSON, HTML)</p>
+            <div class="info-box" id="translate-info-box" style="display: none; background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);">
+                <h4 style="color: #fff;"><i class="fas fa-globe"></i> Translate Text</h4>
+                <p>Upload a .txt file, select source and target languages, and get a translated file. Powered by Google Translate.</p>
+            </div>
+
+            <p class="language-note" id="ocr-note">Supports: PDF, Images (JPG, PNG, BMP, TIFF), Documents (DOCX, PPTX, RTF, ODT), Data (XLSX, CSV, XML, JSON, HTML)</p>
+            <p class="language-note" id="translate-note" style="display: none;">Upload a .txt file to translate. Multiple languages supported.</p>
         </section>
     </main>
 
@@ -139,26 +235,36 @@
         const pageRangeSelect = document.getElementById('page-range-select');
         const startPageGroup = document.getElementById('start-page-group');
         const endPageGroup = document.getElementById('end-page-group');
-        
+        const translatePageRangeSelect = document.getElementById('translate-page-range-select');
+        const translateStartPageGroup = document.getElementById('translate-start-page-group');
+        const translateEndPageGroup = document.getElementById('translate-end-page-group');
+        const ocrOptions = document.getElementById('ocr-options');
+        const translateOptions = document.getElementById('translate-options');
+        const ocrInfoBox = document.getElementById('ocr-info-box');
+        const translateInfoBox = document.getElementById('translate-info-box');
+        const ocrNote = document.getElementById('ocr-note');
+        const translateNote = document.getElementById('translate-note');
+
         let currentTab = 'pdf';
         const pdfTab = document.getElementById('pdf-tab');
         const imageTab = document.getElementById('image-tab');
         const docTab = document.getElementById('doc-tab');
         const dataTab = document.getElementById('data-tab');
+        const translateTab = document.getElementById('translate-tab');
 
         function switchTab(tab) {
-            // Reset all tabs
-            [pdfTab, imageTab, docTab, dataTab].forEach(t => {
+            const allTabs = [pdfTab, imageTab, docTab, dataTab, translateTab];
+            allTabs.forEach(t => {
                 t.style.background = 'white';
                 t.style.color = 'var(--dark)';
                 t.style.borderColor = '#ddd';
                 t.classList.remove('active');
             });
-            
+
             const uploadHint = document.querySelector('.upload-hint');
             let accept = '';
             let hint = '';
-            
+
             if (tab === 'pdf') {
                 pdfTab.style.background = 'var(--git-color)';
                 pdfTab.style.color = 'white';
@@ -167,8 +273,14 @@
                 accept = '.pdf';
                 hint = 'Supports: PDF';
                 currentTab = 'pdf';
-                // Show page range options
-                document.querySelector('.options-grid').style.display = 'grid';
+                uploadForm.action = '/';
+                btnText.textContent = 'Extract Text';
+                ocrOptions.style.display = 'grid';
+                translateOptions.style.display = 'none';
+                ocrInfoBox.style.display = 'block';
+                translateInfoBox.style.display = 'none';
+                ocrNote.style.display = 'block';
+                translateNote.style.display = 'none';
             } else if (tab === 'image') {
                 imageTab.style.background = 'var(--git-color)';
                 imageTab.style.color = 'white';
@@ -177,8 +289,14 @@
                 accept = '.jpg,.jpeg,.png,.bmp,.tiff,.gif';
                 hint = 'Supports: JPG, PNG, BMP, TIFF, GIF';
                 currentTab = 'image';
-                // Hide page range options
-                document.querySelector('.options-grid').style.display = 'none';
+                uploadForm.action = '/';
+                btnText.textContent = 'Extract Text';
+                ocrOptions.style.display = 'grid';
+                translateOptions.style.display = 'none';
+                ocrInfoBox.style.display = 'block';
+                translateInfoBox.style.display = 'none';
+                ocrNote.style.display = 'block';
+                translateNote.style.display = 'none';
             } else if (tab === 'doc') {
                 docTab.style.background = 'var(--git-color)';
                 docTab.style.color = 'white';
@@ -187,8 +305,14 @@
                 accept = '.docx,.doc,.pptx,.ppt,.rtf,.odt,.ods,.odp,.html,.htm,.txt,.md';
                 hint = 'Supports: DOCX, DOC, PPTX, PPT, RTF, ODT, HTML, TXT';
                 currentTab = 'doc';
-                // Hide page range options
-                document.querySelector('.options-grid').style.display = 'none';
+                uploadForm.action = '/';
+                btnText.textContent = 'Extract Text';
+                ocrOptions.style.display = 'grid';
+                translateOptions.style.display = 'none';
+                ocrInfoBox.style.display = 'block';
+                translateInfoBox.style.display = 'none';
+                ocrNote.style.display = 'block';
+                translateNote.style.display = 'none';
             } else if (tab === 'data') {
                 dataTab.style.background = 'var(--git-color)';
                 dataTab.style.color = 'white';
@@ -197,10 +321,32 @@
                 accept = '.xlsx,.xls,.csv,.xml,.json';
                 hint = 'Supports: XLSX, XLS, CSV, XML, JSON';
                 currentTab = 'data';
-                // Hide page range options
-                document.querySelector('.options-grid').style.display = 'none';
+                uploadForm.action = '/';
+                btnText.textContent = 'Extract Text';
+                ocrOptions.style.display = 'grid';
+                translateOptions.style.display = 'none';
+                ocrInfoBox.style.display = 'block';
+                translateInfoBox.style.display = 'none';
+                ocrNote.style.display = 'block';
+                translateNote.style.display = 'none';
+            } else if (tab === 'translate') {
+                translateTab.style.background = 'var(--git-color)';
+                translateTab.style.color = 'white';
+                translateTab.style.borderColor = 'var(--git-color)';
+                translateTab.classList.add('active');
+                accept = '.txt,.md';
+                hint = 'Supports: TXT, MD';
+                currentTab = 'translate';
+                uploadForm.action = '/translate';
+                btnText.textContent = 'Translate';
+                ocrOptions.style.display = 'none';
+                translateOptions.style.display = 'grid';
+                ocrInfoBox.style.display = 'none';
+                translateInfoBox.style.display = 'block';
+                ocrNote.style.display = 'none';
+                translateNote.style.display = 'block';
             }
-            
+
             fileInput.accept = accept;
             uploadHint.textContent = hint;
         }
@@ -209,6 +355,7 @@
         imageTab.addEventListener('click', () => switchTab('image'));
         docTab.addEventListener('click', () => switchTab('doc'));
         dataTab.addEventListener('click', () => switchTab('data'));
+        translateTab.addEventListener('click', () => switchTab('translate'));
 
         fileInput.addEventListener('change', function() {
             if (this.files.length > 0) {
@@ -218,7 +365,6 @@
             }
         });
 
-        // Drag and drop support
         dropZone.addEventListener('dragover', function(e) {
             e.preventDefault();
             this.classList.add('drag-over');
@@ -235,7 +381,7 @@
             if (e.dataTransfer.files.length > 0) {
                 const file = e.dataTransfer.files[0];
                 const ext = file.name.split('.').pop().toLowerCase();
-                
+
                 let allowed = [];
                 if (currentTab === 'pdf') {
                     allowed = ['pdf'];
@@ -245,18 +391,23 @@
                     allowed = ['docx', 'doc', 'pptx', 'ppt', 'rtf', 'odt', 'ods', 'odp', 'html', 'htm', 'txt', 'md'];
                 } else if (currentTab === 'data') {
                     allowed = ['xlsx', 'xls', 'csv', 'xml', 'json'];
+                } else if (currentTab === 'translate') {
+                    allowed = ['txt', 'md'];
                 }
-                
+
                 if (allowed.includes(ext)) {
                     fileInput.files = e.dataTransfer.files;
                     fileName.textContent = file.name;
                 } else {
-                    alert(`Please upload a ${currentTab === 'pdf' ? 'PDF' : currentTab === 'image' ? 'Image' : currentTab === 'doc' ? 'Document' : 'Data'} file`);
+                    const names = {
+                        pdf: 'PDF', image: 'Image', doc: 'Document',
+                        data: 'Data', translate: 'Text'
+                    };
+                    alert(`Please upload a ${names[currentTab] || 'valid'} file`);
                 }
             }
         });
 
-        // Page range selection
         pageRangeSelect.addEventListener('change', function() {
             if (this.value === 'custom') {
                 startPageGroup.style.display = 'flex';
@@ -267,11 +418,20 @@
             }
         });
 
-        // Show loading state on form submit
+        translatePageRangeSelect.addEventListener('change', function() {
+            if (this.value === 'custom') {
+                translateStartPageGroup.style.display = 'flex';
+                translateEndPageGroup.style.display = 'flex';
+            } else {
+                translateStartPageGroup.style.display = 'none';
+                translateEndPageGroup.style.display = 'none';
+            }
+        });
+
         uploadForm.addEventListener('submit', function() {
             submitBtn.disabled = true;
-            btnText.textContent = 'Processing...';
-            loadingText.textContent = 'Submitting for processing...';
+            btnText.textContent = currentTab === 'translate' ? 'Translating...' : 'Processing...';
+            loadingText.textContent = currentTab === 'translate' ? 'Translating file...' : 'Submitting for processing...';
             loadingOverlay.classList.add('active');
         });
     </script>

@@ -39,7 +39,6 @@
     </style>
 </head>
 <body>
-    <!-- Header -->
     <header>
         <div class="header-container">
             <div class="logo">
@@ -64,13 +63,17 @@
                 </div>
 
                 <div class="status-info">
-                    <div class="status-card">
-                        <h4>Detected Language</h4>
+                    <div class="status-card" id="lang-info-section">
+                        <h4>Language</h4>
                         <p id="detected-lang">Detecting...</p>
                     </div>
                     <div class="status-card" id="page-info-section">
                         <h4>Progress</h4>
                         <p id="page-info">Page <span id="current-page">0</span> / <span id="total-pages">...</span></p>
+                    </div>
+                    <div class="status-card" id="chunk-info-section" style="display: none;">
+                        <h4>Chunks</h4>
+                        <p id="chunk-info">Chunk <span id="current-chunk">0</span> / <span id="total-chunks">...</span></p>
                     </div>
                     <div class="status-card" id="eta-section">
                         <h4>ETA</h4>
@@ -117,8 +120,11 @@
         const statusBox = document.getElementById('status-box');
         const statusText = document.getElementById('status-text');
         const pageInfoSection = document.getElementById('page-info-section');
+        const chunkInfoSection = document.getElementById('chunk-info-section');
         const currentPage = document.getElementById('current-page');
         const totalPages = document.getElementById('total-pages');
+        const currentChunk = document.getElementById('current-chunk');
+        const totalChunks = document.getElementById('total-chunks');
         const percentageText = document.getElementById('percentage-text');
         const progressFill = document.getElementById('progress-fill');
         const spinner = document.getElementById('spinner');
@@ -137,6 +143,7 @@
         const simulateInterval = 100;
         let simulationTimer = null;
         let currentFileType = null;
+        let isTranslation = false;
         let currentETA = null;
         let etaTimer = null;
 
@@ -164,7 +171,7 @@
         }
 
         function cancelProcessing() {
-            if (!confirm('Cancel this OCR task?')) return;
+            if (!confirm('Cancel this task?')) return;
             fetch('/cancel/' + taskId, { method: 'POST' })
                 .then(r => r.json())
                 .then(d => {
@@ -174,25 +181,34 @@
                 .catch(() => {});
         }
 
-        // First, get initial status immediately
         fetch(`/progress/${taskId}`)
             .then(response => response.json())
             .then(data => {
                 currentFileType = data.file_type || 'pdf';
-                
-                if (data.detected_language && data.detected_language !== 'auto') {
-                    detectedLang.textContent = data.language_name || data.detected_language;
-                }
-                if (data.filename) {
-                    filenameEl.textContent = `File: ${data.filename}`;
-                }
-                
-                // Hide page info for non-PDF files
-                if (currentFileType !== 'pdf') {
+                isTranslation = data.translating === true;
+
+                if (isTranslation) {
+                    document.querySelector('.progress-status').textContent = 'Translating...';
+                    if (data.target_lang_name) {
+                        detectedLang.textContent = data.source_lang_name + ' → ' + data.target_lang_name;
+                    }
                     pageInfoSection.style.display = 'none';
+                    chunkInfoSection.style.display = 'block';
+                    if (data.filename) {
+                        filenameEl.textContent = 'File: ' + data.filename;
+                    }
+                } else {
+                    if (data.detected_language && data.detected_language !== 'auto') {
+                        detectedLang.textContent = data.language_name || data.detected_language;
+                    }
+                    if (data.filename) {
+                        filenameEl.textContent = 'File: ' + data.filename;
+                    }
+                    if (currentFileType !== 'pdf') {
+                        pageInfoSection.style.display = 'none';
+                    }
                 }
-                
-                // Start simulated progress if not already processing
+
                 if (data.status === 'getting_page_count' || data.status === 'starting' || data.status === 'detecting_language') {
                     startSimulatedProgress();
                 }
@@ -237,19 +253,81 @@
                     return response.json();
                 })
                 .then(data => {
-                    // Update filename
+                    isTranslation = data.translating === true;
+
                     if (data.filename) {
-                        filenameEl.textContent = `File: ${data.filename}`;
+                        filenameEl.textContent = 'File: ' + data.filename;
                     }
-                    
-                    // Update detected language (only for PDF and image)
+
+                    if (isTranslation) {
+                        if (data.target_lang_name) {
+                            detectedLang.textContent = data.source_lang_name + ' → ' + data.target_lang_name;
+                        }
+                        pageInfoSection.style.display = 'none';
+                        chunkInfoSection.style.display = 'block';
+
+                        if (data.total_chunks) {
+                            currentChunk.textContent = data.current_chunk || 0;
+                            totalChunks.textContent = data.total_chunks;
+                        }
+
+                        if (data.status === 'starting') {
+                            statusText.textContent = 'Starting translation...';
+                            percentageText.textContent = '0%';
+                            progressFill.style.width = '0%';
+                            cancelBtn.style.display = 'inline-block';
+                        } else if (data.status === 'translating') {
+                            statusText.textContent = 'Translating... (' + data.source_lang_name + ' → ' + data.target_lang_name + ')';
+                            stopSimulatedProgress();
+                            cancelBtn.style.display = 'inline-block';
+                            if (data.percentage > 0) {
+                                percentageText.textContent = data.percentage + '%';
+                                progressFill.style.width = data.percentage + '%';
+                            }
+                        } else if (data.status === 'completed') {
+                            stopSimulatedProgress();
+                            stopETACountdown();
+                            etaSection.style.display = 'none';
+                            cancelBtn.style.display = 'none';
+                            statusText.textContent = 'Translation completed successfully!';
+                            percentageText.textContent = '100%';
+                            progressFill.style.width = '100%';
+                            spinner.style.display = 'none';
+                            errorBox.style.display = 'none';
+                            downloadBtn.style.display = 'inline-block';
+                            downloadBtn.href = `/download/${taskId}`;
+                            backBtn.style.display = 'inline-block';
+                            clearInterval(pollInterval);
+                        } else if (data.status === 'error') {
+                            statusText.textContent = 'Translation failed';
+                            spinner.style.display = 'none';
+                            errorBox.style.display = 'block';
+                            errorText.textContent = data.error || 'Unknown error occurred';
+                            backBtn.style.display = 'inline-block';
+                            cancelBtn.style.display = 'none';
+                            stopETACountdown();
+                            etaSection.style.display = 'none';
+                            clearInterval(pollInterval);
+                        } else if (data.status === 'cancelled') {
+                            statusText.textContent = 'Task cancelled';
+                            spinner.style.display = 'none';
+                            errorBox.style.display = 'block';
+                            errorText.textContent = data.error || 'Cancelled by user';
+                            backBtn.style.display = 'inline-block';
+                            cancelBtn.style.display = 'none';
+                            stopETACountdown();
+                            etaSection.style.display = 'none';
+                            clearInterval(pollInterval);
+                        }
+                        return;
+                    }
+
                     if (data.language_name) {
                         detectedLang.textContent = data.language_name;
                     } else if (data.detected_language) {
                         detectedLang.textContent = data.detected_language === 'tam' ? 'Tamil' : 'English';
                     }
-                    
-                    // Update page info (only for PDF)
+
                     if (currentFileType === 'pdf') {
                         currentPage.textContent = data.current_page;
                         if (data.pdf_total_pages && data.total_pages && data.pdf_total_pages !== data.total_pages) {
@@ -260,30 +338,29 @@
                             totalPages.textContent = '...';
                         }
                     }
-                    
-                    // Update percentage and status
+
                     if (data.status === 'detecting_language') {
-                        statusText.textContent = `Detecting language...`;
+                        statusText.textContent = 'Detecting language...';
                         percentageText.textContent = '...';
                         progressFill.style.width = '5%';
                         cancelBtn.style.display = 'inline-block';
                     } else if (data.status === 'getting_page_count') {
-                        statusText.textContent = `Getting page count...`;
+                        statusText.textContent = 'Getting page count...';
                         percentageText.textContent = '...';
                         progressFill.style.width = '10%';
                         cancelBtn.style.display = 'inline-block';
                     } else if (data.status === 'starting') {
-                        statusText.textContent = `Starting processing...`;
+                        statusText.textContent = 'Starting processing...';
                         percentageText.textContent = '0%';
                         progressFill.style.width = '0%';
                         cancelBtn.style.display = 'inline-block';
                     } else if (data.status === 'resuming') {
-                        statusText.textContent = `Resuming ${currentFileType.toUpperCase()} from checkpoint...`;
+                        statusText.textContent = 'Resuming ' + currentFileType.toUpperCase() + ' from checkpoint...';
                         stopSimulatedProgress();
                         cancelBtn.style.display = 'inline-block';
                         if (data.percentage > 0) {
-                            percentageText.textContent = `${data.percentage}%`;
-                            progressFill.style.width = `${data.percentage}%`;
+                            percentageText.textContent = data.percentage + '%';
+                            progressFill.style.width = data.percentage + '%';
                         }
                         if (data.eta) {
                             startETACountdown(data.eta);
@@ -297,12 +374,12 @@
                             totalPages.textContent = data.total_pages;
                         }
                     } else if (data.status === 'processing') {
-                        statusText.textContent = `Processing ${currentFileType.toUpperCase()}... (${data.language_name || 'Detected language'})`;
+                        statusText.textContent = 'Processing ' + currentFileType.toUpperCase() + '... (' + (data.language_name || 'Detected language') + ')';
                         stopSimulatedProgress();
                         cancelBtn.style.display = 'inline-block';
                         if (data.percentage > 0) {
-                            percentageText.textContent = `${data.percentage}%`;
-                            progressFill.style.width = `${data.percentage}%`;
+                            percentageText.textContent = data.percentage + '%';
+                            progressFill.style.width = data.percentage + '%';
                         }
                         if (data.eta) {
                             startETACountdown(data.eta);
@@ -316,12 +393,10 @@
                             totalPages.textContent = data.total_pages;
                         }
                     } else if (data.status === 'completed') {
-                        // Stop any running simulation
                         stopSimulatedProgress();
                         stopETACountdown();
                         etaSection.style.display = 'none';
                         cancelBtn.style.display = 'none';
-                        
                         statusText.textContent = 'Processing completed successfully!';
                         percentageText.textContent = '100%';
                         progressFill.style.width = '100%';
@@ -374,7 +449,6 @@
                 });
         }
 
-        // Start polling
         pollInterval = setInterval(updateProgress, 1000);
         updateProgress();
     </script>

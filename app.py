@@ -249,6 +249,72 @@ LANG_CODE_TO_NAME = {
     "ita": "Italian",
 }
 
+# OCR language code to translator language code mapping
+TRANSLATOR_LANG_MAP = {
+    "tam": "ta",
+    "eng": "en",
+    "hin": "hi",
+    "tel": "te",
+    "ben": "bn",
+    "kan": "kn",
+    "mal": "ml",
+    "guj": "gu",
+    "pan": "pa",
+    "mar": "mr",
+    "ara": "ar",
+    "rus": "ru",
+    "ell": "el",
+    "heb": "he",
+    "tha": "th",
+    "chi_sim": "zh-cn",
+    "jpn": "ja",
+    "kor": "ko",
+    "spa": "es",
+    "fra": "fr",
+    "deu": "de",
+    "ita": "it",
+}
+
+# Reverse map: translator code -> display name for translation target languages
+TRANSLATOR_TARGET_LANGS = {
+    "en": "English",
+    "ta": "Tamil",
+    "hi": "Hindi",
+    "te": "Telugu",
+    "bn": "Bengali",
+    "kn": "Kannada",
+    "ml": "Malayalam",
+    "gu": "Gujarati",
+    "pa": "Punjabi",
+    "mr": "Marathi",
+    "ar": "Arabic",
+    "ru": "Russian",
+    "el": "Greek",
+    "he": "Hebrew",
+    "th": "Thai",
+    "zh-cn": "Chinese (Simplified)",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "tr": "Turkish",
+    "vi": "Vietnamese",
+    "id": "Indonesian",
+    "ms": "Malay",
+    "nl": "Dutch",
+    "pl": "Polish",
+    "sv": "Swedish",
+    "da": "Danish",
+    "fi": "Finnish",
+    "cs": "Czech",
+    "ro": "Romanian",
+    "uk": "Ukrainian",
+    "hu": "Hungarian",
+}
+
 def get_file_type(filename):
     """Determine file type and processing method"""
     ext = filename.rsplit('.', 1)[1].lower()
@@ -1634,10 +1700,296 @@ def _ocr_keepalive_ping():
         pass
 
 
+def handle_translate_post():
+    """Handle POST request for translation."""
+    if 'file' not in request.files:
+        flash('No file selected')
+        return redirect(url_for('index'))
+
+    file = request.files['file']
+
+    if file.filename == '':
+        flash('No file selected')
+        return redirect(url_for('index'))
+
+    ext = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
+    if ext not in ('txt', 'md'):
+        flash('Please upload a .txt or .md file for translation')
+        return redirect(url_for('index'))
+
+    source_lang = request.form.get('source_language', 'auto')
+    target_lang = request.form.get('target_language', 'en')
+
+    source_lang = TRANSLATOR_LANG_MAP.get(source_lang, source_lang)
+    target_lang = TRANSLATOR_LANG_MAP.get(target_lang, target_lang)
+
+    if not target_lang:
+        flash('Please select a target language')
+        return redirect(url_for('index'))
+
+    page_range = request.form.get('page_range', 'all')
+    start_page = 1
+    end_page = None
+    if page_range == 'custom':
+        try:
+            start_page = int(request.form.get('start_page', 1))
+            end_page_str = request.form.get('end_page', '').strip()
+            if end_page_str:
+                end_page = int(end_page_str)
+        except ValueError:
+            pass
+
+    filename = secure_filename(file.filename)
+    temp_dir = tempfile.mkdtemp()
+    file_path = os.path.join(temp_dir, filename)
+    file.save(file_path)
+
+    task_id = str(uuid.uuid4())
+    with progress_lock:
+        progress_tracker[task_id] = {
+            "current_chunk": 0,
+            "status": "starting",
+            "error": None,
+            "filename": filename,
+            "temp_dir": temp_dir,
+            "file_path": file_path,
+            "percentage": 0,
+            "total_chunks": None,
+            "total_chars": None,
+            "source_lang": source_lang,
+            "target_lang": target_lang,
+            "file_type": "translation",
+            "created_at": time.time(),
+            "cancelled": False,
+            "translating": True,
+            "start_page": start_page,
+            "end_page": end_page
+        }
+    _save_progress(True)
+
+    thread = threading.Thread(
+        target=translate_file_background,
+        args=(task_id, file_path, filename, temp_dir, source_lang, target_lang, start_page, end_page)
+    )
+    thread.daemon = True
+    thread.start()
+    _ensure_keepalive()
+
+    return render_template('processing.html', task_id=task_id)
+
+
+def translate_text(text, target_lang, source_lang='auto', chunk_size=2000):
+    """Translate text using Google Translate's unofficial API with retries."""
+    from bs4 import BeautifulSoup
+    import requests
+
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    })
+    base_url = 'https://translate.google.com/m'
+
+    def _translate(text, max_retries=3):
+        for attempt in range(max_retries):
+            try:
+                params = {'q': text, 'sl': source_lang, 'tl': target_lang}
+                resp = session.get(base_url, params=params, timeout=15)
+                if resp.status_code == 429:
+                    wait = 30 * (attempt + 1)
+                    logger.warning(f"Translate 429, waiting {wait}s (attempt {attempt+1}/{max_retries})")
+                    time.sleep(wait)
+                    continue
+                if resp.status_code != 200:
+                    if attempt < max_retries - 1:
+                        wait = 5 * (2 ** attempt)
+                        logger.warning(f"Translate status={resp.status_code}, retrying in {wait}s (attempt {attempt+1}/{max_retries})")
+                        time.sleep(wait)
+                        continue
+                    raise Exception(f"HTTP {resp.status_code}")
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                result = soup.find('div', class_='t0')
+                if not result:
+                    result = soup.find('div', class_='result-container')
+                if result:
+                    translated = result.get_text(strip=True)
+                    if translated:
+                        return translated
+                if attempt < max_retries - 1:
+                    time.sleep(5 * (attempt + 1))
+                else:
+                    raise Exception("No translation found in response")
+            except requests.exceptions.Timeout:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Translate timeout, retrying in {5*(attempt+1)}s (attempt {attempt+1}/{max_retries})")
+                    time.sleep(5 * (attempt + 1))
+                else:
+                    raise
+            except requests.exceptions.ConnectionError:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Translate connection error, retrying in {5*(attempt+1)}s (attempt {attempt+1}/{max_retries})")
+                    time.sleep(5 * (attempt + 1))
+                else:
+                    raise
+        raise Exception(f"All {max_retries} attempts failed")
+
+    if len(text) <= chunk_size:
+        return _translate(text)
+
+    result_parts = []
+    total_chars = len(text)
+    start = 0
+    chunk_num = 0
+    while start < total_chars:
+        end = min(start + chunk_size, total_chars)
+        if end < total_chars:
+            break_at = text.rfind('.', start, end)
+            if break_at > start:
+                end = break_at + 1
+        subchunk = text[start:end]
+        try:
+            translated = _translate(subchunk)
+            result_parts.append(translated)
+        except Exception as e:
+            logger.warning(f"Translate subchunk {chunk_num} failed after all retries: {e}")
+            result_parts.append(subchunk)
+        start = end
+        chunk_num += 1
+    return ''.join(result_parts)
+
+
+def translate_file_background(task_id, file_path, filename, temp_dir, source_lang, target_lang, start_page=1, end_page=None):
+    """Background thread to translate a text file and update progress."""
+    try:
+        with progress_lock:
+            progress_tracker[task_id]["status"] = "translating"
+            progress_tracker[task_id]["detected_language"] = source_lang
+
+        output_filename = f"{os.path.splitext(filename)[0]}_translated_{target_lang}.txt"
+        output_path = os.path.join(temp_dir, output_filename)
+
+        with progress_lock:
+            progress_tracker[task_id]["output_path"] = output_path
+            progress_tracker[task_id]["output_filename"] = output_filename
+
+        text = process_txt_file(file_path)
+
+        # Filter by page range if specified
+        if start_page > 1 or end_page is not None:
+            page_pattern = re.compile(r'^--- Page (\d+) ---', re.MULTILINE)
+            matches = list(page_pattern.finditer(text))
+            if matches:
+                first_page = int(matches[0].group(1))
+                selected_pages = []
+                for i, m in enumerate(matches):
+                    page_num = first_page + i
+                    if page_num < start_page:
+                        continue
+                    if end_page is not None and page_num > end_page:
+                        break
+                    next_start = m.end()
+                    next_m = matches[i + 1] if i + 1 < len(matches) else None
+                    page_end = next_m.start() if next_m else len(text)
+                    selected_pages.append(text[next_start:page_end])
+                if selected_pages:
+                    text = '\n\n'.join(selected_pages)
+                    logger.info(f"Task {task_id}: Filtered to pages {start_page}-{end_page or 'end'} ({len(selected_pages)} pages, {len(text)} chars)")
+
+        total_chars = len(text)
+        if total_chars == 0:
+            with progress_lock:
+                progress_tracker[task_id]["status"] = "error"
+                progress_tracker[task_id]["error"] = "Input file is empty"
+            _save_progress(True)
+            return
+
+        with progress_lock:
+            progress_tracker[task_id]["total_chars"] = total_chars
+
+        chunk_size = 4500
+        chunks = []
+        start = 0
+        while start < total_chars:
+            end = min(start + chunk_size, total_chars)
+            if end < total_chars:
+                break_at = text.rfind('.', start, end)
+                if break_at > start:
+                    end = break_at + 1
+            chunks.append(text[start:end])
+            start = end
+
+        total_chunks = len(chunks)
+        with progress_lock:
+            progress_tracker[task_id]["total_chunks"] = total_chunks
+
+        translated_parts = []
+        for i, chunk in enumerate(chunks):
+            if task_id:
+                with progress_lock:
+                    if progress_tracker[task_id].get("cancelled"):
+                        logger.info(f"Task {task_id}: Translation cancelled")
+                        progress_tracker[task_id]["status"] = "cancelled"
+                        progress_tracker[task_id]["error"] = "Cancelled by user"
+                        _save_progress(True)
+                        return
+
+                try:
+                    translated = translate_text(chunk, target_lang)
+                    logger.info(f"Task {task_id}: Chunk {i+1}/{total_chunks} OK (len={len(translated)})")
+                    if translated == chunk:
+                        logger.warning(f"Task {task_id}: Chunk {i+1}/{total_chunks} returned SAME, retrying...")
+                        time.sleep(5)
+                        translated = translate_text(chunk, target_lang)
+                        if translated == chunk:
+                            logger.warning(f"Task {task_id}: Chunk {i+1}/{total_chunks} giving up, using original")
+                    translated_parts.append(translated)
+                except Exception as e:
+                    logger.warning(f"Task {task_id}: Chunk {i+1}/{total_chunks} failed: {e}")
+                    translated_parts.append(chunk)
+
+                time.sleep(5)
+
+                pct = int(((i + 1) / total_chunks) * 100)
+                with progress_lock:
+                    progress_tracker[task_id]["current_chunk"] = i + 1
+                    progress_tracker[task_id]["percentage"] = pct
+                _save_progress()
+
+        result_text = ''.join(translated_parts)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(result_text)
+
+        persist_output(task_id)
+
+        with progress_lock:
+            progress_tracker[task_id]["status"] = "completed"
+            progress_tracker[task_id]["percentage"] = 100
+            progress_tracker[task_id]["completed_at"] = time.time()
+            progress_tracker[task_id]["source_lang"] = source_lang
+            progress_tracker[task_id]["target_lang"] = target_lang
+        _save_progress(True)
+        logger.info(f"Task {task_id}: Translation completed ({total_chunks} chunks, {total_chars} chars)")
+
+    except Exception as e:
+        logger.error(f"Task {task_id}: Translation error - {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        with progress_lock:
+            progress_tracker[task_id]["status"] = "error"
+            progress_tracker[task_id]["error"] = str(e)
+        _save_progress(True)
+    finally:
+        _release_keepalive()
+
+
 @app.route('/', methods=['GET', 'POST'])
+@app.route('/translate', methods=['GET', 'POST'])
 def index():
     if request.method == 'POST':
-        # Check if file was uploaded
+        # Check if translation request
+        is_translate = request.path == '/translate'
+        if is_translate or request.form.get('mode') == 'translate':
+            return handle_translate_post()
+
         if 'file' not in request.files:
             flash('No file selected')
             return redirect(request.url)
@@ -1746,6 +2098,30 @@ def get_progress(task_id):
 
             task = progress_tracker[task_id]
             
+            # Check if this is a translation task
+            is_translation = task.get("translating") or task.get("file_type") == "translation"
+            
+            if is_translation:
+                source = task.get("source_lang", "auto")
+                target = task.get("target_lang", "en")
+                source_display = TRANSLATOR_TARGET_LANGS.get(source, source)
+                target_display = TRANSLATOR_TARGET_LANGS.get(target, target)
+                return jsonify({
+                    "status": task["status"],
+                    "percentage": task.get("percentage", 0),
+                    "error": task["error"],
+                    "filename": task["filename"],
+                    "file_type": "translation",
+                    "source_lang": source,
+                    "source_lang_name": source_display,
+                    "target_lang": target,
+                    "target_lang_name": target_display,
+                    "current_chunk": task.get("current_chunk", 0),
+                    "total_chunks": task.get("total_chunks"),
+                    "total_chars": task.get("total_chars"),
+                    "translating": True
+                })
+            
             # Get language code - use selected language if available
             lang_code = task.get("detected_language")
             if not lang_code or lang_code == 'auto':
@@ -1813,19 +2189,27 @@ def download_result(task_id):
             flash('Result file not found')
             return redirect(url_for('index'))
 
-        # Send file as download
+        output_path = task["output_path"]
+        output_filename = task["output_filename"]
+
+    # Send file as download
+    try:
         response = send_file(
-            task["output_path"],
+            output_path,
             as_attachment=True,
-            download_name=task["output_filename"],
+            download_name=output_filename,
             mimetype='text/plain'
         )
+    except Exception as e:
+        logger.error(f"Download error for {task_id}: {e}")
+        flash('Error sending file')
+        return redirect(url_for('index'))
 
-        # Track download count
-        with progress_lock:
-            progress_tracker[task_id]["download_count"] = progress_tracker[task_id].get("download_count", 0) + 1
+    # Track download count
+    with progress_lock:
+        progress_tracker[task_id]["download_count"] = progress_tracker[task_id].get("download_count", 0) + 1
 
-        return response
+    return response
 
 
 @app.route('/track-download/<task_id>', methods=['POST'])
@@ -1918,7 +2302,7 @@ def cancel_task(task_id):
         task = progress_tracker.get(task_id)
         if not task:
             return jsonify({"error": "Task not found"}), 404
-        if task["status"] not in ("processing", "resuming", "starting", "detecting_language", "getting_page_count"):
+        if task["status"] not in ("processing", "resuming", "starting", "detecting_language", "getting_page_count", "translating"):
             return jsonify({"error": "Task is not running"}), 400
         task["cancelled"] = True
         task["status"] = "cancelling"
@@ -2097,6 +2481,7 @@ def downloads_page():
                     if remaining > 0:
                         eta = int(avg * remaining)
 
+            is_translation = task.get("translating") or task.get("file_type") == "translation"
             info = {
                 "task_id": task_id,
                 "filename": task.get("output_filename", task.get("filename", "Unknown")),
@@ -2112,7 +2497,12 @@ def downloads_page():
                 "status": status,
                 "percentage": task.get("percentage", 0),
                 "eta": eta,
-                "last_checkpoint_page": task.get("last_checkpoint_page")
+                "last_checkpoint_page": task.get("last_checkpoint_page"),
+                "translating": is_translation,
+                "source_lang": task.get("source_lang", ""),
+                "target_lang": task.get("target_lang", ""),
+                "current_chunk": task.get("current_chunk", 0),
+                "total_chunks": task.get("total_chunks")
             }
             all_tasks.append(info)
     all_tasks.reverse()
@@ -2169,4 +2559,4 @@ threading.Thread(target=_cleanup_loop, daemon=True).start()
 if __name__ == '__main__':
     # Local testing only (Render uses Gunicorn)
     port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, threaded=True)

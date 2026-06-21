@@ -31,5 +31,9 @@ Desktop.ini
 # Logs
 *.log
 
+# Generated translations & runtime state
+ocr-outputs/
+progress_tracker.json
+
 # Local dev binaries (not needed for deployment)
 poppler/

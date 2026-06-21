@@ -1265,7 +1265,11 @@ def rebuild_completed_from_mega():
             if not isinstance(finfo, dict):
                 continue
             name = finfo.get('a', {}).get('n', '')
-            if not name.endswith('_ocr.txt') or name.startswith('_'):
+            if name.startswith('_'):
+                continue
+            is_ocr = name.endswith('_ocr.txt')
+            is_translation = '_translated_' in name and name.endswith('.txt')
+            if not is_ocr and not is_translation:
                 continue
 
             hashlib = __import__('hashlib')
@@ -1275,7 +1279,12 @@ def rebuild_completed_from_mega():
                 if tid in progress_tracker:
                     continue
 
-            orig_name = name[:-8].rstrip('_')  # Remove '_ocr.txt' + trailing underscore
+            if is_ocr:
+                orig_name = name[:-8].rstrip('_')
+                file_type = "pdf"
+            else:
+                orig_name = name
+                file_type = "translation"
             with progress_lock:
                 progress_tracker[tid] = {
                     "current_page": 0, "status": "completed",
@@ -1285,7 +1294,7 @@ def rebuild_completed_from_mega():
                     "mega_node_id": nid,
                     "mega_node_info": finfo,
                     "mega_uploaded": True, "mega_status": "uploaded",
-                    "file_type": "pdf", "detected_language": "",
+                    "file_type": file_type, "detected_language": "",
                     "pages_processed": 0, "percentage": 100,
                     "download_count": 0, "completed_at": now, "created_at": now
                 }

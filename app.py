@@ -2253,25 +2253,28 @@ def share_link(task_id):
         if not task or task.get("status") != "completed":
             return jsonify({"error": "Not available"}), 404
         link = task.get("download_link")
-        if link:
-            return jsonify({"link": link})
-        node_info = task.get("mega_node_info")
-        if node_info:
-            try:
-                from mega import Mega
-                email = os.environ.get("MEGA_EMAIL")
-                password = os.environ.get("MEGA_PWD")
-                if email and password:
-                    m = Mega().login(email, password)
-                    link = mega_call(m, "get_link", node_info, timeout=30)
+        output_filename = task.get("output_filename")
+    if link:
+        return jsonify({"link": link})
+    if output_filename:
+        try:
+            from mega import Mega
+            email = os.environ.get("MEGA_EMAIL")
+            password = os.environ.get("MEGA_PWD")
+            if email and password:
+                m = Mega().login(email, password)
+                found = mega_call(m, "find", f"ocr-outputs/{output_filename}", timeout=30)
+                if found:
+                    node = found[0] if isinstance(found, list) else found
+                    link = mega_call(m, "get_link", node, timeout=30)
                     if link:
                         with progress_lock:
                             t = progress_tracker.get(task_id)
                             if t:
                                 t["download_link"] = link
                         return jsonify({"link": link})
-            except Exception as e:
-                logger.error(f"Share link Mega error for {task_id}: {e}")
+        except Exception as e:
+            logger.error(f"Share link Mega error for {task_id}: {e}")
     return jsonify({"link": url_for('download_file', task_id=task_id, _external=True)})
 
 

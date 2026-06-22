@@ -16,14 +16,6 @@ import json
 from flask import Flask, request, render_template, send_file, flash, redirect, url_for, jsonify
 from werkzeug.utils import secure_filename
 from pdf2image import convert_from_path, pdfinfo_from_path
-# Python 3.14 removed pkgutil.find_loader; pytesseract still uses it
-import pkgutil
-if not hasattr(pkgutil, 'find_loader'):
-    import importlib.util
-    def _find_loader(name):
-        spec = importlib.util.find_spec(name)
-        return spec.loader if spec else None
-    pkgutil.find_loader = _find_loader
 import pytesseract
 from pytesseract import image_to_osd
 from PIL import Image

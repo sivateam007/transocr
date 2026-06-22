@@ -13,6 +13,7 @@ import logging
 import time
 import shutil
 import json
+import glob
 from flask import Flask, request, render_template, send_file, flash, redirect, url_for, jsonify
 from werkzeug.utils import secure_filename
 from pdf2image import convert_from_path, pdfinfo_from_path
@@ -2252,8 +2253,9 @@ def preview_text(task_id):
         if not task or task.get("status") != "completed":
             return jsonify({"error": "Not available"}), 404
         output_path = task.get("output_path")
+        output_filename = task.get("output_filename")
+        node_id = task.get("mega_node_id")
         node_info = task.get("mega_node_info")
-        mega_filename = task.get("output_filename")
     if output_path and os.path.exists(output_path):
         try:
             with open(output_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -2261,7 +2263,7 @@ def preview_text(task_id):
             return jsonify({"text": text})
         except Exception as e:
             return jsonify({"text": f"Error reading file: {e}"})
-    if node_info and mega_filename:
+    if node_id and node_info:
         try:
             import tempfile as _tf
             from mega import Mega
@@ -2271,13 +2273,21 @@ def preview_text(task_id):
                 m = Mega().login(email, password)
                 tmp = _tf.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
                 tmp.close()
-                mega_call(m, "download", node_info, dest_path=tmp.name, timeout=30)
+                mega_call(m, "download", (node_id, node_info), dest_path=tmp.name, timeout=30)
                 with open(tmp.name, 'r', encoding='utf-8', errors='replace') as f:
                     text = f.read(1000)
                 os.unlink(tmp.name)
                 return jsonify({"text": text})
         except Exception as e:
             logger.error(f"Preview Mega download failed for {task_id}: {e}")
+    # Fallback: try persisted file in ocr-outputs
+    if output_filename:
+        for f in glob.glob(os.path.join(OUTPUT_DIR, f"{task_id}_*")):
+            try:
+                with open(f, 'r', encoding='utf-8', errors='replace') as fh:
+                    return jsonify({"text": fh.read(1000)})
+            except Exception:
+                pass
     return jsonify({"text": "File not found on local storage or cloud"})
 
 

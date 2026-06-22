@@ -253,6 +253,13 @@
                             etaText.textContent = '--';
                             etaSection.style.display = 'block';
                         }
+                    } else if (data.status === 'translating') {
+                        statusText.textContent = 'Translating... (' + (data.source_lang_name || 'auto') + ' → ' + (data.target_lang_name || 'en') + ')';
+                        cancelBtn.style.display = 'inline-block';
+                        if (data.percentage > 0) {
+                            percentageText.textContent = `${data.percentage}%`;
+                            progressFill.style.width = `${data.percentage}%`;
+                        }
                     } else if (data.status === 'completed') {
                         statusText.textContent = 'Processing completed successfully!';
                         percentageText.textContent = '100%';

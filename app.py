@@ -1729,18 +1729,6 @@ def handle_translate_post():
         flash('Please select a target language')
         return redirect(url_for('index'))
 
-    page_range = request.form.get('page_range', 'all')
-    start_page = 1
-    end_page = None
-    if page_range == 'custom':
-        try:
-            start_page = int(request.form.get('start_page', 1))
-            end_page_str = request.form.get('end_page', '').strip()
-            if end_page_str:
-                end_page = int(end_page_str)
-        except ValueError:
-            pass
-
     filename = secure_filename(file.filename)
     temp_dir = tempfile.mkdtemp()
     file_path = os.path.join(temp_dir, filename)
@@ -1763,15 +1751,13 @@ def handle_translate_post():
             "file_type": "translation",
             "created_at": time.time(),
             "cancelled": False,
-            "translating": True,
-            "start_page": start_page,
-            "end_page": end_page
+            "translating": True
         }
     _save_progress(True)
 
     thread = threading.Thread(
         target=translate_file_background,
-        args=(task_id, file_path, filename, temp_dir, source_lang, target_lang, start_page, end_page)
+        args=(task_id, file_path, filename, temp_dir, source_lang, target_lang)
     )
     thread.daemon = True
     thread.start()
@@ -1859,7 +1845,7 @@ def translate_text(text, target_lang, source_lang='auto', chunk_size=2000):
     return ''.join(result_parts)
 
 
-def translate_file_background(task_id, file_path, filename, temp_dir, source_lang, target_lang, start_page=1, end_page=None):
+def translate_file_background(task_id, file_path, filename, temp_dir, source_lang, target_lang):
     """Background thread to translate a text file and update progress."""
     try:
         with progress_lock:
@@ -1874,28 +1860,6 @@ def translate_file_background(task_id, file_path, filename, temp_dir, source_lan
             progress_tracker[task_id]["output_filename"] = output_filename
 
         text = process_txt_file(file_path)
-
-        # Filter by page range if specified
-        if start_page > 1 or end_page is not None:
-            page_pattern = re.compile(r'^--- Page (\d+) ---', re.MULTILINE)
-            matches = list(page_pattern.finditer(text))
-            if matches:
-                first_page = int(matches[0].group(1))
-                selected_pages = []
-                for i, m in enumerate(matches):
-                    page_num = first_page + i
-                    if page_num < start_page:
-                        continue
-                    if end_page is not None and page_num > end_page:
-                        break
-                    next_start = m.end()
-                    next_m = matches[i + 1] if i + 1 < len(matches) else None
-                    page_end = next_m.start() if next_m else len(text)
-                    selected_pages.append(text[next_start:page_end])
-                if selected_pages:
-                    text = '\n\n'.join(selected_pages)
-                    logger.info(f"Task {task_id}: Filtered to pages {start_page}-{end_page or 'end'} ({len(selected_pages)} pages, {len(text)} chars)")
-
         total_chars = len(text)
         if total_chars == 0:
             with progress_lock:

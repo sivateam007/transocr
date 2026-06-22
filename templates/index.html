@@ -179,23 +179,6 @@
                         </select>
                     </div>
 
-                    <div class="option-group">
-                        <label class="option-label">Page Range</label>
-                        <select name="page_range" id="translate-page-range-select" class="select-input">
-                            <option value="all">All Pages</option>
-                            <option value="custom">Custom Range</option>
-                        </select>
-                    </div>
-
-                    <div class="option-group" id="translate-start-page-group" style="display: none;">
-                        <label class="option-label">Start Page</label>
-                        <input type="number" name="start_page" id="translate-start-page" class="page-input" min="1" value="1" placeholder="From">
-                    </div>
-
-                    <div class="option-group" id="translate-end-page-group" style="display: none;">
-                        <label class="option-label">End Page</label>
-                        <input type="number" name="end_page" id="translate-end-page" class="page-input" min="1" placeholder="To (empty = all)">
-                    </div>
                 </div>
 
                 <button type="submit" class="submit-btn" id="submit-btn">
@@ -235,9 +218,6 @@
         const pageRangeSelect = document.getElementById('page-range-select');
         const startPageGroup = document.getElementById('start-page-group');
         const endPageGroup = document.getElementById('end-page-group');
-        const translatePageRangeSelect = document.getElementById('translate-page-range-select');
-        const translateStartPageGroup = document.getElementById('translate-start-page-group');
-        const translateEndPageGroup = document.getElementById('translate-end-page-group');
         const ocrOptions = document.getElementById('ocr-options');
         const translateOptions = document.getElementById('translate-options');
         const ocrInfoBox = document.getElementById('ocr-info-box');
@@ -415,16 +395,6 @@
             } else {
                 startPageGroup.style.display = 'none';
                 endPageGroup.style.display = 'none';
-            }
-        });
-
-        translatePageRangeSelect.addEventListener('change', function() {
-            if (this.value === 'custom') {
-                translateStartPageGroup.style.display = 'flex';
-                translateEndPageGroup.style.display = 'flex';
-            } else {
-                translateStartPageGroup.style.display = 'none';
-                translateEndPageGroup.style.display = 'none';
             }
         });
 

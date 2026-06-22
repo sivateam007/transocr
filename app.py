@@ -2245,50 +2245,34 @@ def get_mega_link(task_id):
         return jsonify({"error": str(e)}), 500
 
 
-@app.route('/preview/<task_id>')
-def preview_text(task_id):
-    """Return first 1000 chars of OCR result for preview"""
+@app.route('/share-link/<task_id>')
+def share_link(task_id):
+    """Return a shareable download link for a completed task"""
     with progress_lock:
         task = progress_tracker.get(task_id)
         if not task or task.get("status") != "completed":
             return jsonify({"error": "Not available"}), 404
-        output_path = task.get("output_path")
-        output_filename = task.get("output_filename")
-        node_id = task.get("mega_node_id")
+        link = task.get("download_link")
+        if link:
+            return jsonify({"link": link})
         node_info = task.get("mega_node_info")
-    if output_path and os.path.exists(output_path):
-        try:
-            with open(output_path, 'r', encoding='utf-8', errors='replace') as f:
-                text = f.read(1000)
-            return jsonify({"text": text})
-        except Exception as e:
-            return jsonify({"text": f"Error reading file: {e}"})
-    if node_id and node_info:
-        try:
-            import tempfile as _tf
-            from mega import Mega
-            email = os.environ.get("MEGA_EMAIL")
-            password = os.environ.get("MEGA_PWD")
-            if email and password:
-                m = Mega().login(email, password)
-                tmp = _tf.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
-                tmp.close()
-                mega_call(m, "download", (node_id, node_info), dest_path=tmp.name, timeout=30)
-                with open(tmp.name, 'r', encoding='utf-8', errors='replace') as f:
-                    text = f.read(1000)
-                os.unlink(tmp.name)
-                return jsonify({"text": text})
-        except Exception as e:
-            logger.error(f"Preview Mega download failed for {task_id}: {e}")
-    # Fallback: try persisted file in ocr-outputs
-    if output_filename:
-        for f in glob.glob(os.path.join(OUTPUT_DIR, f"{task_id}_*")):
+        if node_info:
             try:
-                with open(f, 'r', encoding='utf-8', errors='replace') as fh:
-                    return jsonify({"text": fh.read(1000)})
-            except Exception:
-                pass
-    return jsonify({"text": "File not found on local storage or cloud"})
+                from mega import Mega
+                email = os.environ.get("MEGA_EMAIL")
+                password = os.environ.get("MEGA_PWD")
+                if email and password:
+                    m = Mega().login(email, password)
+                    link = mega_call(m, "get_link", node_info, timeout=30)
+                    if link:
+                        with progress_lock:
+                            t = progress_tracker.get(task_id)
+                            if t:
+                                t["download_link"] = link
+                        return jsonify({"link": link})
+            except Exception as e:
+                logger.error(f"Share link Mega error for {task_id}: {e}")
+    return jsonify({"link": url_for('download_file', task_id=task_id, _external=True)})
 
 
 @app.route('/cancel/<task_id>', methods=['POST'])
